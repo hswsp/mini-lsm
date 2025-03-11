@@ -18,8 +18,8 @@
 use std::collections::HashMap;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 
 use anyhow::Result;
 use bytes::Bytes;
@@ -294,7 +294,30 @@ impl LsmStorageInner {
 
     /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
     pub fn get(&self, _key: &[u8]) -> Result<Option<Bytes>> {
-        unimplemented!()
+        // 1. 首先检查 memtable
+        if let Some(value) = self.state.read().memtable.get(_key) {
+            // 检查是否是删除标记
+            if value.is_empty() {
+                return Ok(None);
+            }
+            return Ok(Some(value));
+        }
+
+        // 2. 检查 immutable memtables
+        for memtable in self.state.read().imm_memtables.iter() {
+            if let Some(value) = memtable.get(_key) {
+                // 检查是否是删除标记
+                if value.is_empty() {
+                    return Ok(None);
+                }
+                return Ok(Some(value));
+            }
+        }
+
+        // 3. 检查 SSTable 层
+        // TODO: 在实现 SSTable 后添加对 SSTable 的搜索
+
+        Ok(None)
     }
 
     /// Write a batch of data into the storage. Implement in week 2 day 7.
@@ -303,13 +326,36 @@ impl LsmStorageInner {
     }
 
     /// Put a key-value pair into the storage by writing into the current memtable.
-    pub fn put(&self, _key: &[u8], _value: &[u8]) -> Result<()> {
-        unimplemented!()
+    pub fn put(&self, _key: &[u8], value: &[u8]) -> Result<()> {
+        let need_freeze = {
+            // 获取读锁的作用域
+            let state = self.state.read();
+            // 写入 memtable
+            state.memtable.put(_key, value)?;
+            // 检查是否需要冻结，记录结果
+            state.memtable.approximate_size() >= self.options.target_sst_size
+        }; // 这里读锁就被释放了
+
+        // 如果俩线程同时reaches capacity limit.
+        // They will both do a size check on the memtable and decide to freeze it.
+        // In this case, we might create one empty memtable which is then immediately frozen.
+        // 如果需要冻结，在读锁释放后再进行冻结操作
+        if need_freeze {
+            // 获取状态锁来进行 memtable 冻结
+            let state_lock = self.state_lock.lock();
+            // 再次检查大小，因为可能其他线程已经处理了
+            if self.state.read().memtable.approximate_size() >= self.options.target_sst_size {
+                self.force_freeze_memtable(&state_lock)?;
+            }
+        }
+
+        Ok(())
     }
 
     /// Remove a key from the storage by writing an empty value.
     pub fn delete(&self, _key: &[u8]) -> Result<()> {
-        unimplemented!()
+        // 写入空值作为删除标记
+        self.put(_key, &[])
     }
 
     pub(crate) fn path_of_sst_static(path: impl AsRef<Path>, id: usize) -> PathBuf {
@@ -334,7 +380,40 @@ impl LsmStorageInner {
 
     /// Force freeze the current memtable to an immutable memtable
     pub fn force_freeze_memtable(&self, _state_lock_observer: &MutexGuard<'_, ()>) -> Result<()> {
-        unimplemented!()
+        // 在加锁前创建新的 memtable
+        let new_memtable = Arc::new(MemTable::create(self.next_sst_id()));
+
+        // 获取写锁来修改状态
+        let mut state = self.state.write();
+
+        // 检查 immutable memtables 数量是否达到限制
+        if state.imm_memtables.len() >= self.options.num_memtable_limit {
+            // 如果达到Maximum number of memtables in memory，先刷新一个 immutable memtable 到磁盘
+            drop(state); // 释放写锁，避免死锁
+            self.force_flush_next_imm_memtable()?;
+            state = self.state.write(); // 重新获取写锁
+        }
+
+        // 替换当前 memtable，将旧的移动到 immutable memtables
+        let old_state = Arc::new(LsmStorageState {
+            memtable: new_memtable,
+            imm_memtables: {
+                let mut new_imm = Vec::with_capacity(state.imm_memtables.len() + 1);
+                // 将当前 memtable 放在最前面（最新的）
+                new_imm.push(state.memtable.clone());
+                // 添加现有的 immutable memtables
+                new_imm.extend(state.imm_memtables.iter().cloned());
+                new_imm
+            },
+            l0_sstables: state.l0_sstables.clone(),
+            levels: state.levels.clone(),
+            sstables: state.sstables.clone(),
+        });
+
+        // 原子地更新状态
+        *state = old_state;
+
+        Ok(())
     }
 
     /// Force flush the earliest-created immutable memtable to disk

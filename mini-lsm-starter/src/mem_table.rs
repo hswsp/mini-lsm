@@ -17,8 +17,8 @@
 
 use std::ops::Bound;
 use std::path::Path;
-use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 
 use anyhow::Result;
 use bytes::Bytes;
@@ -49,11 +49,21 @@ pub(crate) fn map_bound(bound: Bound<&[u8]>) -> Bound<Bytes> {
         Bound::Unbounded => Bound::Unbounded,
     }
 }
+/// 范围查询示例
+/// storage.scan(
+///     Bound::Included(b"key1"),  // 从 "key1" 开始（包含）
+///     Bound::Excluded(b"key5")   // 到 "key5" 结束（不包含）
+/// )
 
 impl MemTable {
     /// Create a new mem-table.
-    pub fn create(_id: usize) -> Self {
-        unimplemented!()
+    pub fn create(id: usize) -> Self {
+        Self {
+            map: Arc::new(SkipMap::new()),
+            wal: None,
+            id,
+            approximate_size: Arc::new(AtomicUsize::new(0)),
+        }
     }
 
     /// Create a new mem-table with WAL
@@ -83,8 +93,9 @@ impl MemTable {
     }
 
     /// Get a value by key.
-    pub fn get(&self, _key: &[u8]) -> Option<Bytes> {
-        unimplemented!()
+    pub fn get(&self, key: &[u8]) -> Option<Bytes> {
+        let key_bytes = Bytes::copy_from_slice(key);
+        self.map.get(&key_bytes).map(|e| e.value().clone())
     }
 
     /// Put a key-value pair into the mem-table.
@@ -92,8 +103,20 @@ impl MemTable {
     /// In week 1, day 1, simply put the key-value pair into the skipmap.
     /// In week 2, day 6, also flush the data to WAL.
     /// In week 3, day 5, modify the function to use the batch API.
-    pub fn put(&self, _key: &[u8], _value: &[u8]) -> Result<()> {
-        unimplemented!()
+    pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        let key_bytes = Bytes::copy_from_slice(key);
+        let value_bytes = Bytes::copy_from_slice(value);
+
+        // 更新近似大小, freeze the memtable at best effort.
+        // If a key is put twice, though the skiplist only contains the latest value,
+        // you may count it twice in the approximate memtable size
+        self.approximate_size.fetch_add(
+            key.len() + value.len(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+
+        self.map.insert(key_bytes, value_bytes);
+        Ok(())
     }
 
     /// Implement this in week 3, day 5.
@@ -109,13 +132,25 @@ impl MemTable {
     }
 
     /// Get an iterator over a range of keys.
-    pub fn scan(&self, _lower: Bound<&[u8]>, _upper: Bound<&[u8]>) -> MemTableIterator {
-        unimplemented!()
+    pub fn scan(&self, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> MemTableIterator {
+        let (lower_bound, upper_bound) = (map_bound(lower), map_bound(upper));
+
+        MemTableIteratorBuilder {
+            map: self.map.clone(),
+            item: (Bytes::new(), Bytes::new()),
+            iter_builder: |map| map.range((lower_bound, upper_bound)),
+        }
+        .build()
     }
 
-    /// Flush the mem-table to SSTable. Implement in week 1 day 6.
-    pub fn flush(&self, _builder: &mut SsTableBuilder) -> Result<()> {
-        unimplemented!()
+    /// Flush the mem-table to SSTable.
+    pub fn flush(&self, builder: &mut SsTableBuilder) -> Result<()> {
+        for entry in self.map.iter() {
+            let key = entry.key();
+            let value = entry.value();
+            builder.add(KeySlice::from_slice(key), value);
+        }
+        Ok(())
     }
 
     pub fn id(&self) -> usize {
@@ -138,7 +173,8 @@ type SkipMapRangeIter<'a> =
 
 /// An iterator over a range of `SkipMap`. This is a self-referential structure and please refer to week 1, day 2
 /// chapter for more information.
-///
+/// If the iterator does not have a lifetime generics parameter, we should ensure that whenever the iterator is being used, 
+/// the underlying skiplist object is not freed. The only way to achieve that is to put the Arc<SkipMap> object into the iterator itself. 
 /// This is part of week 1, day 2.
 #[self_referencing]
 pub struct MemTableIterator {
@@ -156,18 +192,30 @@ impl StorageIterator for MemTableIterator {
     type KeyType<'a> = KeySlice<'a>;
 
     fn value(&self) -> &[u8] {
-        unimplemented!()
+        &self.borrow_item().1[..]
     }
 
     fn key(&self) -> KeySlice {
-        unimplemented!()
+        KeySlice::from_slice(&self.borrow_item().0)
     }
 
     fn is_valid(&self) -> bool {
-        unimplemented!()
+        !self.borrow_item().0.is_empty()
     }
 
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        // Store the new item outside the first closure
+        let new_item = self.with_iter_mut(|iter| {
+            if let Some(entry) = iter.next() {
+                (entry.key().clone(), entry.value().clone())
+            } else {
+                (Bytes::new(), Bytes::new())
+            }
+        });
+        // Update the item in a separate borrow
+        self.with_mut(|fields| {
+            *fields.item = new_item;
+        });
+        Ok(())
     }
 }
