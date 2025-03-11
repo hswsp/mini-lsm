@@ -59,7 +59,20 @@ pub struct MergeIterator<I: StorageIterator> {
 
 impl<I: StorageIterator> MergeIterator<I> {
     pub fn create(iters: Vec<Box<I>>) -> Self {
-        unimplemented!()
+        // 创建一个优先队列来存储有效的迭代器
+        let mut heap = BinaryHeap::new();
+        
+        // 将所有有效的迭代器加入堆中
+        for (idx, iter) in iters.into_iter().enumerate() {
+            if iter.is_valid() {
+                heap.push(HeapWrapper(idx, iter));
+            }
+        }
+
+        // 从堆中取出第一个迭代器作为当前迭代器
+        let current = heap.pop();
+        
+        Self { iters: heap, current }
     }
 }
 
@@ -69,18 +82,53 @@ impl<I: 'static + for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>> StorageIt
     type KeyType<'a> = KeySlice<'a>;
 
     fn key(&self) -> KeySlice {
-        unimplemented!()
+        self.current.as_ref().unwrap().1.key()
     }
 
     fn value(&self) -> &[u8] {
-        unimplemented!()
+        self.current.as_ref().unwrap().1.value()
     }
 
     fn is_valid(&self) -> bool {
-        unimplemented!()
+        self.current.is_some()
     }
 
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        // 如果当前没有有效的迭代器，直接返回
+        if !self.is_valid() {
+            return Ok(());
+        }
+
+        // 提前获取当前 key 并转换为 owned 类型
+        let current_key = self.key().to_key_vec();
+
+        // 移动当前迭代器到下一个位置
+        if let Some(mut current) = self.current.take() {
+            current.1.next()?;
+            // 如果当前迭代器仍然有效，将其放回堆中
+            if current.1.is_valid() {
+                self.iters.push(current);
+            }
+        }
+
+        // 处理堆中所有相同 key 的迭代器（使用临时堆避免借用冲突）
+        let mut temp_heap = std::mem::take(&mut self.iters);
+        let mut remaining = BinaryHeap::new();
+        
+        while let Some(mut iter) = temp_heap.pop() {
+            if iter.1.key() == KeySlice::from_slice(current_key.raw_ref()) {
+                iter.1.next()?;
+                if iter.1.is_valid() {
+                    remaining.push(iter);
+                }
+            } else {
+                remaining.push(iter);
+            }
+        }
+        self.iters = remaining;
+
+        // 从堆中取出下一个最小元素
+        self.current = self.iters.pop();
+        Ok(())
     }
 }
