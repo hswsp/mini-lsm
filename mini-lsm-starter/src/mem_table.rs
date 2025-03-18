@@ -54,7 +54,6 @@ pub(crate) fn map_bound(bound: Bound<&[u8]>) -> Bound<Bytes> {
 ///     Bound::Included(b"key1"),  // 从 "key1" 开始（包含）
 ///     Bound::Excluded(b"key5")   // 到 "key5" 结束（不包含）
 /// )
-
 impl MemTable {
     /// Create a new mem-table.
     pub fn create(id: usize) -> Self {
@@ -135,12 +134,17 @@ impl MemTable {
     pub fn scan(&self, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> MemTableIterator {
         let (lower_bound, upper_bound) = (map_bound(lower), map_bound(upper));
 
-        MemTableIteratorBuilder {
+        let mut iterator = MemTableIteratorBuilder {
             map: self.map.clone(),
             item: (Bytes::new(), Bytes::new()),
             iter_builder: |map| map.range((lower_bound, upper_bound)),
-        }
-        .build()
+        } // SkipMap::range 返回的迭代器本身就是按键升序排列的。
+        .build();
+
+        // 调用一次 next() 函数以获取第一个元素
+        iterator.next().unwrap();
+
+        iterator
     }
 
     /// Flush the mem-table to SSTable.
@@ -173,8 +177,8 @@ type SkipMapRangeIter<'a> =
 
 /// An iterator over a range of `SkipMap`. This is a self-referential structure and please refer to week 1, day 2
 /// chapter for more information.
-/// If the iterator does not have a lifetime generics parameter, we should ensure that whenever the iterator is being used, 
-/// the underlying skiplist object is not freed. The only way to achieve that is to put the Arc<SkipMap> object into the iterator itself. 
+/// If the iterator does not have a lifetime generics parameter, we should ensure that whenever the iterator is being used,
+/// the underlying skiplist object is not freed. The only way to achieve that is to put the Arc<SkipMap> object into the iterator itself.
 /// This is part of week 1, day 2.
 #[self_referencing]
 pub struct MemTableIterator {
@@ -183,7 +187,7 @@ pub struct MemTableIterator {
     /// Stores a skipmap iterator that refers to the lifetime of `MemTableIterator` itself.
     #[borrows(map)]
     #[not_covariant]
-    iter: SkipMapRangeIter<'this>,
+    iter: SkipMapRangeIter<'this>, // 要么返回一个包含键值对的 Some(Entry<'a, K, V>)，要么在迭代结束时返回 None。
     /// Stores the current key-value pair.
     item: (Bytes, Bytes),
 }
@@ -206,11 +210,9 @@ impl StorageIterator for MemTableIterator {
     fn next(&mut self) -> Result<()> {
         // Store the new item outside the first closure
         let new_item = self.with_iter_mut(|iter| {
-            if let Some(entry) = iter.next() {
-                (entry.key().clone(), entry.value().clone())
-            } else {
-                (Bytes::new(), Bytes::new())
-            }
+            iter.next() // 直接使用 SkipMap 的有序迭代器
+                .map(|e| (e.key().clone(), e.value().clone()))
+                .unwrap_or_default()
         });
         // Update the item in a separate borrow
         self.with_mut(|fields| {

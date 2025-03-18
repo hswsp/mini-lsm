@@ -15,7 +15,7 @@
 #![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 
 use crate::{
     iterators::{StorageIterator, merge_iterator::MergeIterator},
@@ -39,19 +39,27 @@ impl StorageIterator for LsmIterator {
     type KeyType<'a> = &'a [u8];
 
     fn is_valid(&self) -> bool {
-        unimplemented!()
+        self.inner.is_valid()
     }
 
     fn key(&self) -> &[u8] {
-        unimplemented!()
+        self.inner.key().raw_ref()
     }
 
     fn value(&self) -> &[u8] {
-        unimplemented!()
+        self.inner.value()
     }
 
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        // 推进底层迭代器
+        self.inner.next()?;
+
+        // 跳过删除标记（空值）
+        while self.inner.is_valid() && self.inner.value().is_empty() {
+            self.inner.next()?;
+        }
+
+        Ok(())
     }
 }
 
@@ -65,10 +73,20 @@ pub struct FusedIterator<I: StorageIterator> {
 
 impl<I: StorageIterator> FusedIterator<I> {
     pub fn new(iter: I) -> Self {
-        Self {
+        let mut fused = Self {
             iter,
             has_errored: false,
+        };
+
+        // Skip any deleted keys (empty values) at initialization
+        while fused.iter.is_valid() && fused.iter.value().is_empty() {
+            if fused.iter.next().is_err() {
+                fused.has_errored = true;
+                break;
+            }
         }
+
+        fused
     }
 }
 
@@ -79,18 +97,47 @@ impl<I: StorageIterator> StorageIterator for FusedIterator<I> {
         Self: 'a;
 
     fn is_valid(&self) -> bool {
-        unimplemented!()
+        !self.has_errored && self.iter.is_valid()
     }
 
     fn key(&self) -> Self::KeyType<'_> {
-        unimplemented!()
+        if self.has_errored {
+            panic!("called key() on invalid iterator");
+        }
+        self.iter.key()
     }
 
     fn value(&self) -> &[u8] {
-        unimplemented!()
+        if self.has_errored {
+            panic!("called value() on invalid iterator");
+        }
+        self.iter.value()
     }
 
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        if self.has_errored {
+            bail!("iterator already errored");
+        }
+
+        // Continue calling next() while:
+        // 1. The iterator is valid
+        // 2. The current value is empty (indicates deletion)
+        while self.iter.is_valid() {
+            match self.iter.next() {
+                Ok(_) => {
+                    // 如果当前值是空的（删除标记），继续调用 next
+                    if !self.iter.is_valid() || !self.iter.value().is_empty() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    self.has_errored = true;
+                    return Err(e);
+                }
+            }
+        }
+
+        // !is_valid() do nothing
+        Ok(())
     }
 }

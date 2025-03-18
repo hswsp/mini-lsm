@@ -30,11 +30,14 @@ use crate::compact::{
     CompactionController, CompactionOptions, LeveledCompactionController, LeveledCompactionOptions,
     SimpleLeveledCompactionController, SimpleLeveledCompactionOptions, TieredCompactionController,
 };
-use crate::lsm_iterator::{FusedIterator, LsmIterator};
-use crate::manifest::Manifest;
-use crate::mem_table::MemTable;
-use crate::mvcc::LsmMvccInner;
-use crate::table::SsTable;
+use crate::{
+    iterators::merge_iterator::MergeIterator,
+    lsm_iterator::{FusedIterator, LsmIterator},
+    manifest::Manifest,
+    mem_table::{MemTable, MemTableIterator},
+    mvcc::LsmMvccInner,
+    table::SsTable,
+};
 
 pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
 
@@ -293,6 +296,7 @@ impl LsmStorageInner {
     }
 
     /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
+    /// delete implementation should simply put an empty slice for that key
     pub fn get(&self, _key: &[u8]) -> Result<Option<Bytes>> {
         // 1. 首先检查 memtable
         if let Some(value) = self.state.read().memtable.get(_key) {
@@ -432,6 +436,28 @@ impl LsmStorageInner {
         _lower: Bound<&[u8]>,
         _upper: Bound<&[u8]>,
     ) -> Result<FusedIterator<LsmIterator>> {
-        unimplemented!()
+        let state = self.state.read();
+
+        // 收集所有 memtable 迭代器
+        let mut mem_iters = Vec::new();
+
+        // 添加当前 memtable
+        mem_iters.push(state.memtable.scan(_lower, _upper));
+
+        // 添加 immutable memtables
+        for imm_mem in &state.imm_memtables {
+            mem_iters.push(imm_mem.scan(_lower, _upper));
+        }
+
+        // 转换为 Box<MemTableIterator> 的集合
+        let boxed_iters: Vec<Box<MemTableIterator>> = mem_iters.into_iter().map(Box::new).collect();
+
+        // 创建合并迭代器
+        let merge_iter = MergeIterator::create(boxed_iters);
+
+        // 包装成 LsmIterator
+        let lsm_iter = LsmIterator::new(merge_iter)?;
+
+        Ok(FusedIterator::new(lsm_iter))
     }
 }

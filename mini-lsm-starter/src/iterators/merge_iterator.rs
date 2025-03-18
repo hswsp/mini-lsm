@@ -17,6 +17,7 @@
 
 use std::cmp::{self};
 use std::collections::BinaryHeap;
+use std::collections::binary_heap::PeekMut;
 
 use anyhow::Result;
 
@@ -44,9 +45,9 @@ impl<I: StorageIterator> Ord for HeapWrapper<I> {
     fn cmp(&self, other: &Self) -> cmp::Ordering {
         self.1
             .key()
-            .cmp(&other.1.key())
-            .then(self.0.cmp(&other.0))
-            .reverse()
+            .cmp(&other.1.key()) // 1. 先按 key 升序排列
+            .then(self.0.cmp(&other.0)) // 2. key 相同时按索引升序
+            .reverse() // 3. 反转顺序（因为 BinaryHeap 是最大堆）
     }
 }
 
@@ -59,9 +60,9 @@ pub struct MergeIterator<I: StorageIterator> {
 
 impl<I: StorageIterator> MergeIterator<I> {
     pub fn create(iters: Vec<Box<I>>) -> Self {
-        // 创建一个优先队列来存储有效的迭代器
+        // 创建一个优先队列来存储有效的迭代器，这里前提是每一个迭代器有序
         let mut heap = BinaryHeap::new();
-        
+
         // 将所有有效的迭代器加入堆中
         for (idx, iter) in iters.into_iter().enumerate() {
             if iter.is_valid() {
@@ -71,8 +72,11 @@ impl<I: StorageIterator> MergeIterator<I> {
 
         // 从堆中取出第一个迭代器作为当前迭代器
         let current = heap.pop();
-        
-        Self { iters: heap, current }
+
+        Self {
+            iters: heap,
+            current,
+        }
     }
 }
 
@@ -94,41 +98,50 @@ impl<I: 'static + for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>> StorageIt
     }
 
     fn next(&mut self) -> Result<()> {
-        // 如果当前没有有效的迭代器，直接返回
         if !self.is_valid() {
             return Ok(());
         }
 
-        // 提前获取当前 key 并转换为 owned 类型
+        // 当我们移动迭代器时（调用 next()），原来的引用可能会失效.
+        // to_key_vec() 获取数据的所有权，确保数据在整个 next() 方法执行期间都有效
         let current_key = self.key().to_key_vec();
 
-        // 移动当前迭代器到下一个位置
+        // Advance current iterator
+        // 保证current始终存储从iters.pop()出来的迭代器
         if let Some(mut current) = self.current.take() {
             current.1.next()?;
-            // 如果当前迭代器仍然有效，将其放回堆中
+            // If the current iterator is no longer valid, we need to pop it from heap.
             if current.1.is_valid() {
                 self.iters.push(current);
             }
         }
 
-        // 处理堆中所有相同 key 的迭代器（使用临时堆避免借用冲突）
-        let mut temp_heap = std::mem::take(&mut self.iters);
-        let mut remaining = BinaryHeap::new();
-        
-        while let Some(mut iter) = temp_heap.pop() {
-            if iter.1.key() == KeySlice::from_slice(current_key.raw_ref()) {
-                iter.1.next()?;
-                if iter.1.is_valid() {
-                    remaining.push(iter);
+        // Process all entries with the same key using peek_mut
+        while let Some(mut inner_iter) = self.iters.peek_mut() {
+            debug_assert!(
+                inner_iter.1.key() >= KeySlice::from_slice(current_key.raw_ref()),
+                "heap invariant violated"
+            );
+
+            if inner_iter.1.key() == KeySlice::from_slice(current_key.raw_ref()) {
+                // Case 1: an error occurred when calling `next`.
+                if let e @ Err(_) = inner_iter.1.next() {
+                    // we still need to pop the iterator from heap
+                    PeekMut::pop(inner_iter);
+                    return e;
+                }
+                // Case 2: iter is no longer valid.
+                if !inner_iter.1.is_valid() {
+                    PeekMut::pop(inner_iter);
                 }
             } else {
-                remaining.push(iter);
+                break;
             }
         }
-        self.iters = remaining;
 
-        // 从堆中取出下一个最小元素
+        // Get next smallest element
         self.current = self.iters.pop();
+
         Ok(())
     }
 }
