@@ -23,6 +23,7 @@ use bytes::Bytes;
 pub use iterator::BlockIterator;
 
 /// A block is the smallest unit of read and caching in LSM tree. It is a collection of sorted key-value pairs.
+/// num_of_elements not stored in the block, but can be inferred from offsets.
 pub struct Block {
     pub(crate) data: Vec<u8>,
     pub(crate) offsets: Vec<u16>,
@@ -31,12 +32,62 @@ pub struct Block {
 impl Block {
     /// Encode the internal data to the data layout illustrated in the course
     /// Note: You may want to recheck if any of the expected field is missing from your output
+    /// block encoding format
+    /// --------------------------------------------------------------------------------------------------------------------
+    /// |             Data Section             |              Offset Section                            |      Extra      |
+    /// --------------------------------------------------------------------------------------------------------------------
+    /// | Entry #1 | Entry #2 | ... | Entry #N | Offset #1 (2B) | Offset #2 (2B) | ... | Offset #N (2B) | num_of_elements |
+    /// --------------------------------------------------------------------------------------------------------------------
+    /// Each entry is a key-value pair:
+    /// -----------------------------------------------------------------------
+    /// |                           Entry #1                            | ... |
+    /// -----------------------------------------------------------------------
+    /// | key_len (2B) | key (keylen) | value_len (2B) | value (varlen) | ... |
+    /// -----------------------------------------------------------------------
     pub fn encode(&self) -> Bytes {
-        unimplemented!()
+        let mut buf = Vec::with_capacity(
+            self.data.len() + // Data Section
+            self.offsets.len() * 2 + // Offset Section (2B each)
+            2, // num_of_elements (2B)
+        );
+
+        // 1. Write Data Section
+        buf.extend_from_slice(&self.data);
+
+        // 2. Write Offset Section
+        for offset in &self.offsets {
+            buf.extend_from_slice(&offset.to_le_bytes());
+        }
+
+        // 3. Write number of elements
+        buf.extend_from_slice(&(self.offsets.len() as u16).to_le_bytes());
+
+        // Convert to Bytes
+        Bytes::from(buf)
     }
 
     /// Decode from the data layout, transform the input `data` to a single `Block`
     pub fn decode(data: &[u8]) -> Self {
-        unimplemented!()
+        // Read number of elements (last 2 bytes)
+        let num_elements = u16::from_le_bytes(data[data.len() - 2..].try_into().unwrap()) as usize;
+
+        // Calculate sections
+        let offsets_section_size = num_elements * 2; // 2 bytes per offset
+        let offsets_start = data.len() - 2 - offsets_section_size;
+
+        // Extract offsets
+        let mut offsets = Vec::with_capacity(num_elements);
+        for i in 0..num_elements {
+            let offset_bytes = &data[offsets_start + i * 2..offsets_start + (i + 1) * 2];
+            offsets.push(u16::from_le_bytes(offset_bytes.try_into().unwrap()));
+        }
+
+        // Extract data
+        let data_section = data[..offsets_start].to_vec();
+
+        Block {
+            data: data_section,
+            offsets,
+        }
     }
 }
