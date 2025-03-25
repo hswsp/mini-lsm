@@ -42,6 +42,7 @@ impl<I: StorageIterator> PartialOrd for HeapWrapper<I> {
 }
 
 impl<I: StorageIterator> Ord for HeapWrapper<I> {
+    /// 堆排序：先按 key 升序排列，key 相同时按索引升序
     fn cmp(&self, other: &Self) -> cmp::Ordering {
         self.1
             .key()

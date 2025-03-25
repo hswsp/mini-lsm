@@ -25,6 +25,8 @@ pub trait StorageIterator {
     fn value(&self) -> &[u8];
 
     /// Get the current key.
+    // Returns a reference that borrows from self
+    // The borrow lasts as long as the returned reference is used
     fn key(&self) -> Self::KeyType<'_>;
 
     /// Check if the current iterator is valid.

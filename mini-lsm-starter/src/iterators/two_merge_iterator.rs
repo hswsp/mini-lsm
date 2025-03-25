@@ -21,10 +21,12 @@ use super::StorageIterator;
 
 /// Merges two iterators of different types into one. If the two iterators have the same key, only
 /// produce the key once and prefer the entry from A.
+/// When we scan from the storage engine, we will need to merge data from both memtable iterators and SST iterators into a single one
 pub struct TwoMergeIterator<A: StorageIterator, B: StorageIterator> {
     a: A,
     b: B,
     // Add fields as need
+    use_a: bool, // flag to indicate which iterator to read from
 }
 
 impl<
@@ -32,8 +34,35 @@ impl<
     B: 'static + for<'a> StorageIterator<KeyType<'a> = A::KeyType<'a>>,
 > TwoMergeIterator<A, B>
 {
+    /// Helper function to determine which iterator to use
+    fn select_iterator(&self) -> bool {
+        if self.a.is_valid() && self.b.is_valid() {
+            // Both valid - use A if its key is smaller or equal
+            self.a.key() <= self.b.key()
+        } else {
+            // Use A if it's valid, otherwise use B
+            self.a.is_valid()
+        }
+    }
+
+    /// Skip any duplicate keys in B that match A's current key
+    fn skip_b_duplicates(&mut self) -> Result<()> {
+        while self.a.is_valid() && self.b.is_valid() && self.b.key() == self.a.key() {
+            self.b.next()?;
+        }
+        Ok(())
+    }
+
     pub fn create(a: A, b: B) -> Result<Self> {
-        unimplemented!()
+        let mut iter = Self { a, b, use_a: true };
+
+        // Initially choose the smaller key, or a if equal
+        iter.use_a = iter.select_iterator();
+
+        // Skip any duplicates at initialization
+        iter.skip_b_duplicates()?;
+
+        Ok(iter)
     }
 }
 
@@ -45,18 +74,44 @@ impl<
     type KeyType<'a> = A::KeyType<'a>;
 
     fn key(&self) -> Self::KeyType<'_> {
-        unimplemented!()
+        if self.use_a {
+            self.a.key()
+        } else {
+            self.b.key()
+        }
     }
 
     fn value(&self) -> &[u8] {
-        unimplemented!()
+        if self.use_a {
+            self.a.value()
+        } else {
+            self.b.value()
+        }
     }
 
     fn is_valid(&self) -> bool {
-        unimplemented!()
+        (self.use_a && self.a.is_valid()) || (!self.use_a && self.b.is_valid())
     }
 
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        if !self.is_valid() {
+            return Ok(());
+        }
+
+        if self.use_a {
+            // We were using iterator A
+            self.a.next()?;
+        } else {
+            // We were using iterator B
+            self.b.next()?;
+        }
+
+        // Skip duplicates using the helper method
+        self.skip_b_duplicates()?;
+
+        // Choose next iterator
+        self.use_a = self.select_iterator();
+
+        Ok(())
     }
 }

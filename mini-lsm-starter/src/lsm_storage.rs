@@ -30,6 +30,11 @@ use crate::compact::{
     CompactionController, CompactionOptions, LeveledCompactionController, LeveledCompactionOptions,
     SimpleLeveledCompactionController, SimpleLeveledCompactionOptions, TieredCompactionController,
 };
+use crate::iterators::StorageIterator;
+use crate::iterators::two_merge_iterator::TwoMergeIterator;
+use crate::key::KeySlice;
+use crate::mem_table::map_bound;
+use crate::table::SsTableIterator;
 use crate::{
     iterators::merge_iterator::MergeIterator,
     lsm_iterator::{FusedIterator, LsmIterator},
@@ -245,6 +250,33 @@ impl MiniLsm {
     }
 }
 
+fn range_overlap(
+    user_begin: Bound<&[u8]>,
+    user_end: Bound<&[u8]>,
+    table_begin: KeySlice,
+    table_end: KeySlice,
+) -> bool {
+    match user_end {
+        Bound::Excluded(key) if key <= table_begin.raw_ref() => {
+            return false;
+        }
+        Bound::Included(key) if key < table_begin.raw_ref() => {
+            return false;
+        }
+        _ => {}
+    }
+    match user_begin {
+        Bound::Excluded(key) if key >= table_end.raw_ref() => {
+            return false;
+        }
+        Bound::Included(key) if key > table_end.raw_ref() => {
+            return false;
+        }
+        _ => {}
+    }
+    true
+}
+
 impl LsmStorageInner {
     pub(crate) fn next_sst_id(&self) -> usize {
         self.next_sst_id
@@ -298,8 +330,13 @@ impl LsmStorageInner {
     /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
     /// delete implementation should simply put an empty slice for that key
     pub fn get(&self, _key: &[u8]) -> Result<Option<Bytes>> {
+        let snapshot = {
+            let guard = self.state.read();
+            Arc::clone(&guard)
+        };
+
         // 1. 首先检查 memtable
-        if let Some(value) = self.state.read().memtable.get(_key) {
+        if let Some(value) = snapshot.memtable.get(_key) {
             // 检查是否是删除标记
             if value.is_empty() {
                 return Ok(None);
@@ -308,7 +345,7 @@ impl LsmStorageInner {
         }
 
         // 2. 检查 immutable memtables
-        for memtable in self.state.read().imm_memtables.iter() {
+        for memtable in snapshot.imm_memtables.iter() {
             if let Some(value) = memtable.get(_key) {
                 // 检查是否是删除标记
                 if value.is_empty() {
@@ -320,8 +357,23 @@ impl LsmStorageInner {
 
         // 3. 检查 SSTable 层
         // TODO: 在实现 SSTable 后添加对 SSTable 的搜索
+        let merge_iter =
+            self.create_sst_merge_iterator(&snapshot, Bound::Included(_key), Bound::Unbounded)?;
+        if !merge_iter.is_valid() {
+            return Ok(None);
+        }
 
-        Ok(None)
+        // Check if we found the exact key
+        if merge_iter.key().raw_ref() == _key {
+            let value = merge_iter.value();
+            if value.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(Bytes::copy_from_slice(value)))
+            }
+        } else {
+            Ok(None)
+        }
     }
 
     /// Write a batch of data into the storage. Implement in week 2 day 7.
@@ -436,28 +488,101 @@ impl LsmStorageInner {
         _lower: Bound<&[u8]>,
         _upper: Bound<&[u8]>,
     ) -> Result<FusedIterator<LsmIterator>> {
-        let state = self.state.read();
+        // Take a snapshot of the state to release the lock early
+        let snapshot = {
+            let guard = self.state.read();
+            Arc::clone(&guard)
+        };
 
         // 收集所有 memtable 迭代器
         let mut mem_iters = Vec::new();
 
         // 添加当前 memtable
-        mem_iters.push(state.memtable.scan(_lower, _upper));
+        mem_iters.push(snapshot.memtable.scan(_lower, _upper));
 
         // 添加 immutable memtables
-        for imm_mem in &state.imm_memtables {
+        // 最新的在最前面
+        for imm_mem in &snapshot.imm_memtables {
             mem_iters.push(imm_mem.scan(_lower, _upper));
         }
 
         // 转换为 Box<MemTableIterator> 的集合
         let boxed_iters: Vec<Box<MemTableIterator>> = mem_iters.into_iter().map(Box::new).collect();
-
         // 创建合并迭代器
-        let merge_iter = MergeIterator::create(boxed_iters);
+        let mem_merge_iter = MergeIterator::create(boxed_iters);
 
-        // 包装成 LsmIterator
-        let lsm_iter = LsmIterator::new(merge_iter)?;
+        // Create SSTable iterators (outside the critical section)
+
+        let sst_merge_iter = self.create_sst_merge_iterator(&snapshot, _lower, _upper)?;
+        let two_merge_iter = TwoMergeIterator::create(mem_merge_iter, sst_merge_iter)?;
+
+        // Create LSM iterator with upper bound
+        let lsm_iter = LsmIterator::new(two_merge_iter, map_bound(_upper))?;
 
         Ok(FusedIterator::new(lsm_iter))
+    }
+
+    fn create_sst_iterator(sst: &Arc<SsTable>, lower: Bound<&[u8]>) -> Result<SsTableIterator> {
+        match lower {
+            Bound::Included(key) => {
+                SsTableIterator::create_and_seek_to_key(sst.clone(), KeySlice::from_slice(key))
+            }
+            Bound::Excluded(key) => {
+                // Create iterator and seek to key
+                let key = KeySlice::from_slice(key);
+                let mut iter = SsTableIterator::create_and_seek_to_key(sst.clone(), key)?;
+                // If the iterator points to the excluded key, move to next key
+                if iter.is_valid() && iter.key() == key {
+                    iter.next()?;
+                }
+                Ok(iter)
+            }
+            Bound::Unbounded => SsTableIterator::create_and_seek_to_first(sst.clone()),
+        }
+    }
+
+    fn create_sst_merge_iterator(
+        &self,
+        snapshot: &Arc<LsmStorageState>,
+        lower: Bound<&[u8]>,
+        upper: Bound<&[u8]>,
+    ) -> Result<MergeIterator<SsTableIterator>> {
+        let mut sst_iters = Vec::new();
+
+        // Add L0 SSTs (newest to oldest)
+        // 注意存入的时候需要按newest to oldest的顺序存入
+        for &sst_id in snapshot.l0_sstables.iter() {
+            if let Some(sst) = snapshot.sstables.get(&sst_id) {
+                if range_overlap(
+                    lower,
+                    upper,
+                    sst.first_key().as_key_slice(),
+                    sst.last_key().as_key_slice(),
+                ) {
+                    sst_iters.push(Self::create_sst_iterator(sst, lower)?);
+                }
+            }
+        }
+
+        // Add other levels
+        for (_, level_ssts) in &snapshot.levels {
+            //注意存入的时候需要按newest to oldest的顺序存入
+            for &sst_id in level_ssts.iter() {
+                if let Some(sst) = snapshot.sstables.get(&sst_id) {
+                    if range_overlap(
+                        lower,
+                        upper,
+                        sst.first_key().as_key_slice(),
+                        sst.last_key().as_key_slice(),
+                    ) {
+                        sst_iters.push(Self::create_sst_iterator(sst, lower)?);
+                    }
+                }
+            }
+        }
+
+        Ok(MergeIterator::create(
+            sst_iters.into_iter().map(Box::new).collect(),
+        ))
     }
 }

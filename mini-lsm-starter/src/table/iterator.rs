@@ -25,7 +25,7 @@ use crate::{block::BlockIterator, iterators::StorageIterator, key::KeySlice};
 /// An iterator over the contents of an SSTable.
 /// you should load data on demand.
 pub struct SsTableIterator {
-    table: Arc<SsTable>,
+    pub table: Arc<SsTable>,
     blk_iter: BlockIterator,
     blk_idx: usize,
 }

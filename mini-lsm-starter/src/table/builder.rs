@@ -79,13 +79,13 @@ impl SsTableBuilder {
         self.last_key = key.raw_ref().to_vec();
 
         // Print first and last keys as both hex and UTF-8 strings
-        println!(
-            "Current state: first_key: {} ({:02?}), last_key: {} ({:02?})",
-            String::from_utf8_lossy(&self.first_key),
-            self.first_key,
-            String::from_utf8_lossy(&self.last_key),
-            self.last_key
-        );
+        // println!(
+        //     "Current state: first_key: {} ({:02?}), last_key: {} ({:02?})",
+        //     String::from_utf8_lossy(&self.first_key),
+        //     self.first_key,
+        //     String::from_utf8_lossy(&self.last_key),
+        //     self.last_key
+        // );
     }
 
     /// Seals the current block and prepares for a new block.
