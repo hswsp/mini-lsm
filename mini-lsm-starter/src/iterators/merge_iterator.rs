@@ -145,4 +145,23 @@ impl<I: 'static + for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>> StorageIt
 
         Ok(())
     }
+
+    /// Remember to also take MergeIterator::current into account
+    fn num_active_iterators(&self) -> usize {
+        // Sum up active iterators in the heap
+        let heap_active = self
+            .iters
+            .iter()
+            .map(|wrapper| wrapper.1.num_active_iterators())
+            .sum::<usize>();
+
+        // Add current iterator's active count if it exists
+        let current_active = self
+            .current
+            .as_ref()
+            .map(|wrapper| wrapper.1.num_active_iterators())
+            .unwrap_or(0);
+
+        heap_active + current_active
+    }
 }

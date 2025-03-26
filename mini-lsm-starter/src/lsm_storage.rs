@@ -34,7 +34,7 @@ use crate::iterators::StorageIterator;
 use crate::iterators::two_merge_iterator::TwoMergeIterator;
 use crate::key::KeySlice;
 use crate::mem_table::map_bound;
-use crate::table::SsTableIterator;
+use crate::table::{SsTableBuilder, SsTableIterator};
 use crate::{
     iterators::merge_iterator::MergeIterator,
     lsm_iterator::{FusedIterator, LsmIterator},
@@ -177,7 +177,39 @@ impl Drop for MiniLsm {
 
 impl MiniLsm {
     pub fn close(&self) -> Result<()> {
-        unimplemented!()
+        // Signal the threads to stop
+        self.flush_notifier.send(())?;
+        self.compaction_notifier.send(())?;
+
+        // Take the thread handles
+        let mut flush_thread = self.flush_thread.lock();
+        let mut compaction_thread = self.compaction_thread.lock();
+
+        // Wait for threads to finish
+        if let Some(thread) = flush_thread.take() {
+            thread
+                .join()
+                .map_err(|e| anyhow::anyhow!("flush thread panicked: {:?}", e))?;
+        }
+
+        if let Some(thread) = compaction_thread.take() {
+            thread
+                .join()
+                .map_err(|e| anyhow::anyhow!("compaction thread panicked: {:?}", e))?;
+        }
+
+        // Flush any remaining data in memtables
+        if !self.inner.state.read().memtable.is_empty() {
+            self.inner
+                .force_freeze_memtable(&self.inner.state_lock.lock())?;
+        }
+        while !self.inner.state.read().imm_memtables.is_empty() {
+            self.inner.force_flush_next_imm_memtable()?;
+        }
+
+        self.inner.sync_dir()?;
+
+        Ok(())
     }
 
     /// Start the storage engine by either loading an existing directory or creating a new one if the directory does
@@ -287,6 +319,11 @@ impl LsmStorageInner {
     /// not exist.
     pub(crate) fn open(path: impl AsRef<Path>, options: LsmStorageOptions) -> Result<Self> {
         let path = path.as_ref();
+        // Create the directory if it doesn't exist
+        if !path.exists() {
+            std::fs::create_dir_all(path)?;
+        }
+
         let state = LsmStorageState::create(&options);
 
         let compaction_controller = match &options.compaction_options {
@@ -357,8 +394,11 @@ impl LsmStorageInner {
 
         // 3. 检查 SSTable 层
         // TODO: 在实现 SSTable 后添加对 SSTable 的搜索
-        let merge_iter =
-            self.create_sst_merge_iterator(&snapshot, Bound::Included(_key), Bound::Unbounded)?;
+        let merge_iter = self.create_sst_merge_iterator(
+            &snapshot,
+            Bound::Included(_key),
+            Bound::Included(_key),
+        )?;
         if !merge_iter.is_valid() {
             return Ok(None);
         }
@@ -431,7 +471,9 @@ impl LsmStorageInner {
     }
 
     pub(super) fn sync_dir(&self) -> Result<()> {
-        unimplemented!()
+        let dir = std::fs::File::open(&self.path)?;
+        dir.sync_all()?;
+        Ok(())
     }
 
     /// Force freeze the current memtable to an immutable memtable
@@ -451,7 +493,7 @@ impl LsmStorageInner {
         }
 
         // 替换当前 memtable，将旧的移动到 immutable memtables
-        let old_state = Arc::new(LsmStorageState {
+        let new_state = Arc::new(LsmStorageState {
             memtable: new_memtable,
             imm_memtables: {
                 let mut new_imm = Vec::with_capacity(state.imm_memtables.len() + 1);
@@ -467,14 +509,80 @@ impl LsmStorageInner {
         });
 
         // 原子地更新状态
-        *state = old_state;
+        *state = new_state;
 
         Ok(())
     }
 
     /// Force flush the earliest-created immutable memtable to disk
     pub fn force_flush_next_imm_memtable(&self) -> Result<()> {
-        unimplemented!()
+        // Take state lock to ensure only one flush operation at a time
+        let _state_lock = self.state_lock.lock();
+
+        // Get the memtable to flush while holding a read lock
+        let memtable_to_flush = {
+            let state = self.state.read();
+            if state.imm_memtables.is_empty() {
+                return Ok(());
+            }
+            state.imm_memtables.last().cloned().unwrap()
+        };
+
+        // Create and build SST outside of any locks
+        let sst_id = self.next_sst_id();
+        let mut builder = SsTableBuilder::new(self.options.block_size);
+        memtable_to_flush.flush(&mut builder)?;
+
+        let sst = builder.build(
+            sst_id,
+            Some(self.block_cache.clone()),
+            self.path_of_sst(sst_id),
+        )?;
+        let sst = Arc::new(sst);
+        // Update state with write lock
+        {
+            let mut state = self.state.write();
+            // Double check the memtable is still there and is the same one
+            if let Some(last) = state.imm_memtables.last() {
+                if Arc::ptr_eq(last, &memtable_to_flush) {
+                    // Create new state with modifications
+                    let new_state = Arc::new(LsmStorageState {
+                        memtable: state.memtable.clone(),
+                        imm_memtables: {
+                            let mut new_imm = state.imm_memtables.clone();
+                            new_imm.pop(); // Remove the last memtable
+                            new_imm
+                        },
+                        l0_sstables: {
+                            let mut new_l0 = Vec::with_capacity(state.l0_sstables.len() + 1);
+                            new_l0.push(sst_id); // Add newest SST first
+                            new_l0.extend(state.l0_sstables.iter().cloned()); // Add existing SSTs
+                            new_l0
+                        },
+                        levels: state.levels.clone(),
+                        sstables: {
+                            let mut new_sst = state.sstables.clone();
+                            new_sst.insert(sst_id, sst);
+                            new_sst
+                        },
+                    });
+
+                    // Replace the old state with the new one
+                    *state = new_state;
+                }
+            }
+        }
+
+        // Sync directory after releasing the write lock
+        self.sync_dir()?;
+
+        println!(
+            "Flushed memtable {} to L0 SST {}",
+            memtable_to_flush.id(),
+            sst_id
+        );
+
+        Ok(())
     }
 
     pub fn new_txn(&self) -> Result<()> {
@@ -553,6 +661,8 @@ impl LsmStorageInner {
         // 注意存入的时候需要按newest to oldest的顺序存入
         for &sst_id in snapshot.l0_sstables.iter() {
             if let Some(sst) = snapshot.sstables.get(&sst_id) {
+                // filter out some SSTs that do not contain the key range,
+                // so that we do not need to read them in the merge iterator
                 if range_overlap(
                     lower,
                     upper,

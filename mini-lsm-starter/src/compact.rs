@@ -161,6 +161,24 @@ impl LsmStorageInner {
     }
 
     fn trigger_flush(&self) -> Result<()> {
+        // Check memtable count in a separate scope to drop the read lock early
+        let should_flush = {
+            let state = self.state.read();
+            state.imm_memtables.len() >= self.options.num_memtable_limit
+        };
+
+        // If total memtables exceed limit, flush the earliest one
+        if should_flush {
+            // Double check the condition after taking the lock
+            let should_flush = {
+                let state = self.state.read();
+                state.imm_memtables.len() >= self.options.num_memtable_limit
+            };
+            if should_flush {
+                self.force_flush_next_imm_memtable()?;
+            }
+        }
+
         Ok(())
     }
 
