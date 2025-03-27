@@ -29,9 +29,20 @@ use crate::{
 };
 
 /// Represents the internal type for an LSM iterator. This type will be changed across the course for multiple times.
-// type LsmIteratorInner = MergeIterator<MemTableIterator>;
-type LsmIteratorInner =
-    TwoMergeIterator<MergeIterator<MemTableIterator>, MergeIterator<SsTableIterator>>;
+/// type LsmIteratorInner = MergeIterator<MemTableIterator>;
+/// type LsmIteratorInner =
+///      TwoMergeIterator<MergeIterator<MemTableIterator>, MergeIterator<SsTableIterator>>;
+///
+// Update the type definition to use nested TwoMergeIterator
+type LsmIteratorInner = TwoMergeIterator<
+    // First part: merge memtables and L0 SSTs
+    TwoMergeIterator<
+        MergeIterator<MemTableIterator>, // Memtables iterator
+        MergeIterator<SsTableIterator>,  // L0 SSTs iterator
+    >,
+    // Second part: L1+ iterator (which uses concat iterator internally)
+    MergeIterator<SsTableIterator>, // L1+ SSTs iterator using concat
+>;
 
 pub struct LsmIterator {
     inner: LsmIteratorInner,

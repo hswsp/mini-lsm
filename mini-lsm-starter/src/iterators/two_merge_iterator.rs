@@ -46,6 +46,7 @@ impl<
     }
 
     /// Skip any duplicate keys in B that match A's current key
+    /// 所以这是有先后顺序的，默认A的优先级高于B,初始化的时候需要注意。
     fn skip_b_duplicates(&mut self) -> Result<()> {
         while self.a.is_valid() && self.b.is_valid() && self.b.key() == self.a.key() {
             self.b.next()?;

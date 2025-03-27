@@ -393,12 +393,16 @@ impl LsmStorageInner {
         }
 
         // 3. 检查 SSTable 层
-        // TODO: 在实现 SSTable 后添加对 SSTable 的搜索
-        let merge_iter = self.create_sst_merge_iterator(
+        // Create SSTable iterators (outside the critical section)
+        let l0_merge_iter =
+            self.create_l0_sst_iter(&snapshot, Bound::Included(_key), Bound::Included(_key))?;
+        let level_merge_iter = self.create_level_ssts_merge_iterator(
             &snapshot,
             Bound::Included(_key),
             Bound::Included(_key),
         )?;
+        let merge_iter = TwoMergeIterator::create(l0_merge_iter, level_merge_iter)?;
+
         if !merge_iter.is_valid() {
             return Ok(None);
         }
@@ -516,9 +520,6 @@ impl LsmStorageInner {
 
     /// Force flush the earliest-created immutable memtable to disk
     pub fn force_flush_next_imm_memtable(&self) -> Result<()> {
-        // Take state lock to ensure only one flush operation at a time
-        let _state_lock = self.state_lock.lock();
-
         // Get the memtable to flush while holding a read lock
         let memtable_to_flush = {
             let state = self.state.read();
@@ -541,46 +542,55 @@ impl LsmStorageInner {
         let sst = Arc::new(sst);
         // Update state with write lock
         {
+            // Take state lock to ensure only one flush operation at a time
+            let _state_lock = self.state_lock.lock();
             let mut state = self.state.write();
             // Double check the memtable is still there and is the same one
             if let Some(last) = state.imm_memtables.last() {
-                if Arc::ptr_eq(last, &memtable_to_flush) {
-                    // Create new state with modifications
-                    let new_state = Arc::new(LsmStorageState {
-                        memtable: state.memtable.clone(),
-                        imm_memtables: {
-                            let mut new_imm = state.imm_memtables.clone();
-                            new_imm.pop(); // Remove the last memtable
-                            new_imm
-                        },
-                        l0_sstables: {
-                            let mut new_l0 = Vec::with_capacity(state.l0_sstables.len() + 1);
-                            new_l0.push(sst_id); // Add newest SST first
-                            new_l0.extend(state.l0_sstables.iter().cloned()); // Add existing SSTs
-                            new_l0
-                        },
-                        levels: state.levels.clone(),
-                        sstables: {
-                            let mut new_sst = state.sstables.clone();
-                            new_sst.insert(sst_id, sst);
-                            new_sst
-                        },
-                    });
-
-                    // Replace the old state with the new one
-                    *state = new_state;
+                if !Arc::ptr_eq(last, &memtable_to_flush) {
+                    println!(
+                        "skip flushing {}.sst with size={}, other thread has done this",
+                        sst_id,
+                        sst.table_size()
+                    );
+                    return Ok(());
                 }
+                // Create new state with modifications
+                let new_state = Arc::new(LsmStorageState {
+                    memtable: state.memtable.clone(),
+                    imm_memtables: {
+                        let mut new_imm = state.imm_memtables.clone();
+                        new_imm.pop(); // Remove the last memtable
+                        new_imm
+                    },
+                    l0_sstables: {
+                        let mut new_l0 = Vec::with_capacity(state.l0_sstables.len() + 1);
+                        new_l0.push(sst_id); // Add newest SST first
+                        new_l0.extend(state.l0_sstables.iter().cloned()); // Add existing SSTs
+                        new_l0
+                    },
+                    levels: state.levels.clone(),
+                    sstables: {
+                        let mut new_sst = state.sstables.clone();
+                        new_sst.insert(sst_id, sst.clone());
+                        new_sst
+                    },
+                });
+
+                // Replace the old state with the new one
+                println!("flushed {}.sst with size={}", sst_id, sst.table_size());
+                *state = new_state;
             }
         }
 
         // Sync directory after releasing the write lock
         self.sync_dir()?;
 
-        println!(
-            "Flushed memtable {} to L0 SST {}",
-            memtable_to_flush.id(),
-            sst_id
-        );
+        // println!(
+        //     "Flushed memtable {} to L0 SST {}",
+        //     memtable_to_flush.id(),
+        //     sst_id
+        // );
 
         Ok(())
     }
@@ -616,13 +626,14 @@ impl LsmStorageInner {
 
         // 转换为 Box<MemTableIterator> 的集合
         let boxed_iters: Vec<Box<MemTableIterator>> = mem_iters.into_iter().map(Box::new).collect();
-        // 创建合并迭代器
+        // 创建MemTableIterator
         let mem_merge_iter = MergeIterator::create(boxed_iters);
-
         // Create SSTable iterators (outside the critical section)
+        let l0_merge_iter = self.create_l0_sst_iter(&snapshot, _lower, _upper)?;
+        let level_merge_iter = self.create_level_ssts_merge_iterator(&snapshot, _lower, _upper)?;
 
-        let sst_merge_iter = self.create_sst_merge_iterator(&snapshot, _lower, _upper)?;
-        let two_merge_iter = TwoMergeIterator::create(mem_merge_iter, sst_merge_iter)?;
+        let l0_sst_merge_iter = TwoMergeIterator::create(mem_merge_iter, l0_merge_iter)?;
+        let two_merge_iter = TwoMergeIterator::create(l0_sst_merge_iter, level_merge_iter)?;
 
         // Create LSM iterator with upper bound
         let lsm_iter = LsmIterator::new(two_merge_iter, map_bound(_upper))?;
@@ -649,32 +660,41 @@ impl LsmStorageInner {
         }
     }
 
-    fn create_sst_merge_iterator(
+    fn create_l0_sst_iter(
         &self,
         snapshot: &Arc<LsmStorageState>,
         lower: Bound<&[u8]>,
         upper: Bound<&[u8]>,
     ) -> Result<MergeIterator<SsTableIterator>> {
-        let mut sst_iters = Vec::new();
+        let mut l0_iters = Vec::new();
 
         // Add L0 SSTs (newest to oldest)
         // 注意存入的时候需要按newest to oldest的顺序存入
         for &sst_id in snapshot.l0_sstables.iter() {
             if let Some(sst) = snapshot.sstables.get(&sst_id) {
-                // filter out some SSTs that do not contain the key range,
-                // so that we do not need to read them in the merge iterator
                 if range_overlap(
                     lower,
                     upper,
                     sst.first_key().as_key_slice(),
                     sst.last_key().as_key_slice(),
                 ) {
-                    sst_iters.push(Self::create_sst_iterator(sst, lower)?);
+                    l0_iters.push(Self::create_sst_iterator(sst, lower)?);
                 }
             }
         }
+        Ok(MergeIterator::create(
+            l0_iters.into_iter().map(Box::new).collect(),
+        ))
+    }
 
-        // Add other levels
+    fn create_level_ssts_merge_iterator(
+        &self,
+        snapshot: &Arc<LsmStorageState>,
+        lower: Bound<&[u8]>,
+        upper: Bound<&[u8]>,
+    ) -> Result<MergeIterator<SsTableIterator>> {
+        let mut sst_iters = Vec::new();
+        // Create L1+ iterator
         for (_, level_ssts) in &snapshot.levels {
             //注意存入的时候需要按newest to oldest的顺序存入
             for &sst_id in level_ssts.iter() {
