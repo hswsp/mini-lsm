@@ -31,6 +31,7 @@ use crate::compact::{
     SimpleLeveledCompactionController, SimpleLeveledCompactionOptions, TieredCompactionController,
 };
 use crate::iterators::StorageIterator;
+use crate::iterators::concat_iterator::SstConcatIterator;
 use crate::iterators::two_merge_iterator::TwoMergeIterator;
 use crate::key::KeySlice;
 use crate::mem_table::map_bound;
@@ -420,6 +421,24 @@ impl LsmStorageInner {
         }
     }
 
+    fn try_freeze(&self, estimated_size: usize) -> Result<()> {
+        // 如果需要冻结，在读锁释放后再进行冻结操作
+        if estimated_size < self.options.target_sst_size {
+            return Ok(());
+        }
+        // 检查 immutable memtables 数量是否达到限制
+        if self.state.read().imm_memtables.len() + 1 > self.options.num_memtable_limit {
+            // Flush one immutable memtable to make room
+            self.force_flush_next_imm_memtable()?;
+        }
+        // 获取状态锁来进行 memtable 冻结
+        let state_lock = self.state_lock.lock();
+        // 再次检查大小，因为可能其他线程已经处理了
+        if self.state.read().memtable.approximate_size() >= self.options.target_sst_size {
+            self.force_freeze_memtable(&state_lock)?;
+        }
+        Ok(())
+    }
     /// Write a batch of data into the storage. Implement in week 2 day 7.
     pub fn write_batch<T: AsRef<[u8]>>(&self, _batch: &[WriteBatchRecord<T>]) -> Result<()> {
         unimplemented!()
@@ -427,27 +446,19 @@ impl LsmStorageInner {
 
     /// Put a key-value pair into the storage by writing into the current memtable.
     pub fn put(&self, _key: &[u8], value: &[u8]) -> Result<()> {
-        let need_freeze = {
+        let estimated_size = {
             // 获取读锁的作用域
             let state = self.state.read();
             // 写入 memtable
             state.memtable.put(_key, value)?;
             // 检查是否需要冻结，记录结果
-            state.memtable.approximate_size() >= self.options.target_sst_size
+            state.memtable.approximate_size()
         }; // 这里读锁就被释放了
 
         // 如果俩线程同时reaches capacity limit.
         // They will both do a size check on the memtable and decide to freeze it.
         // In this case, we might create one empty memtable which is then immediately frozen.
-        // 如果需要冻结，在读锁释放后再进行冻结操作
-        if need_freeze {
-            // 获取状态锁来进行 memtable 冻结
-            let state_lock = self.state_lock.lock();
-            // 再次检查大小，因为可能其他线程已经处理了
-            if self.state.read().memtable.approximate_size() >= self.options.target_sst_size {
-                self.force_freeze_memtable(&state_lock)?;
-            }
-        }
+        self.try_freeze(estimated_size)?;
 
         Ok(())
     }
@@ -487,33 +498,15 @@ impl LsmStorageInner {
 
         // 获取写锁来修改状态
         let mut state = self.state.write();
+        // Swap the current memtable with a new one.
+        let mut snapshot = state.as_ref().clone();
+        let old_memtable = std::mem::replace(&mut snapshot.memtable, new_memtable);
 
-        // 检查 immutable memtables 数量是否达到限制
-        if state.imm_memtables.len() >= self.options.num_memtable_limit {
-            // 如果达到Maximum number of memtables in memory，先刷新一个 immutable memtable 到磁盘
-            drop(state); // 释放写锁，避免死锁
-            self.force_flush_next_imm_memtable()?;
-            state = self.state.write(); // 重新获取写锁
-        }
+        // Add the memtable to the immutable memtables.
+        snapshot.imm_memtables.insert(0, old_memtable.clone());
 
-        // 替换当前 memtable，将旧的移动到 immutable memtables
-        let new_state = Arc::new(LsmStorageState {
-            memtable: new_memtable,
-            imm_memtables: {
-                let mut new_imm = Vec::with_capacity(state.imm_memtables.len() + 1);
-                // 将当前 memtable 放在最前面（最新的）
-                new_imm.push(state.memtable.clone());
-                // 添加现有的 immutable memtables
-                new_imm.extend(state.imm_memtables.iter().cloned());
-                new_imm
-            },
-            l0_sstables: state.l0_sstables.clone(),
-            levels: state.levels.clone(),
-            sstables: state.sstables.clone(),
-        });
-
-        // 原子地更新状态
-        *state = new_state;
+        // 原子地更新状态, 因为 _state_lock_observer 已被持有
+        *state = Arc::new(snapshot);
 
         Ok(())
     }
@@ -641,6 +634,7 @@ impl LsmStorageInner {
         Ok(FusedIterator::new(lsm_iter))
     }
 
+    /// for l0 sst iterator
     fn create_sst_iterator(sst: &Arc<SsTable>, lower: Bound<&[u8]>) -> Result<SsTableIterator> {
         match lower {
             Bound::Included(key) => {
@@ -657,6 +651,27 @@ impl LsmStorageInner {
                 Ok(iter)
             }
             Bound::Unbounded => SsTableIterator::create_and_seek_to_first(sst.clone()),
+        }
+    }
+
+    /// for level sst iterator
+    fn create_sst_concat_iterator(
+        ssts: Vec<Arc<SsTable>>,
+        lower: Bound<&[u8]>,
+    ) -> Result<SstConcatIterator> {
+        match lower {
+            Bound::Included(key) => {
+                SstConcatIterator::create_and_seek_to_key(ssts, KeySlice::from_slice(key))
+            }
+            Bound::Excluded(key) => {
+                let key = KeySlice::from_slice(key);
+                let mut iter = SstConcatIterator::create_and_seek_to_key(ssts, key)?;
+                if iter.is_valid() && iter.key() == key {
+                    iter.next()?;
+                }
+                Ok(iter)
+            }
+            Bound::Unbounded => SstConcatIterator::create_and_seek_to_first(ssts),
         }
     }
 
@@ -692,10 +707,11 @@ impl LsmStorageInner {
         snapshot: &Arc<LsmStorageState>,
         lower: Bound<&[u8]>,
         upper: Bound<&[u8]>,
-    ) -> Result<MergeIterator<SsTableIterator>> {
+    ) -> Result<MergeIterator<SstConcatIterator>> {
         let mut sst_iters = Vec::new();
         // Create L1+ iterator
         for (_, level_ssts) in &snapshot.levels {
+            let mut ssts = Vec::new();
             //注意存入的时候需要按newest to oldest的顺序存入
             for &sst_id in level_ssts.iter() {
                 if let Some(sst) = snapshot.sstables.get(&sst_id) {
@@ -705,10 +721,11 @@ impl LsmStorageInner {
                         sst.first_key().as_key_slice(),
                         sst.last_key().as_key_slice(),
                     ) {
-                        sst_iters.push(Self::create_sst_iterator(sst, lower)?);
+                        ssts.push(Arc::clone(sst));
                     }
                 }
             }
+            sst_iters.push(Self::create_sst_concat_iterator(ssts, lower)?);
         }
 
         Ok(MergeIterator::create(

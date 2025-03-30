@@ -22,7 +22,8 @@ use bytes::Bytes;
 
 use crate::{
     iterators::{
-        StorageIterator, merge_iterator::MergeIterator, two_merge_iterator::TwoMergeIterator,
+        StorageIterator, concat_iterator::SstConcatIterator, merge_iterator::MergeIterator,
+        two_merge_iterator::TwoMergeIterator,
     },
     mem_table::MemTableIterator,
     table::SsTableIterator,
@@ -41,7 +42,7 @@ type LsmIteratorInner = TwoMergeIterator<
         MergeIterator<SsTableIterator>,  // L0 SSTs iterator
     >,
     // Second part: L1+ iterator (which uses concat iterator internally)
-    MergeIterator<SsTableIterator>, // L1+ SSTs iterator using concat
+    MergeIterator<SstConcatIterator>, // L1+ SSTs iterator using concat
 >;
 
 pub struct LsmIterator {

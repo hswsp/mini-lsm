@@ -238,8 +238,10 @@ pub fn compaction_bench(storage: Arc<MiniLsm>) {
     let mut max_key = 0;
     let overlaps = if TS_ENABLED { 10000 } else { 20000 };
     for iter in 0..10 {
+        println!("iter = {}", iter);
         let range_begin = iter * 5000;
         for i in range_begin..(range_begin + overlaps) {
+            println!("i = {}", i);
             // 120B per key, 4MB data populated
             let key: String = gen_key(i);
             let version = key_map.get(&i).copied().unwrap_or_default() + 1;

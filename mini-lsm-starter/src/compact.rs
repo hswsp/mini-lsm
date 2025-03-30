@@ -34,8 +34,47 @@ use crate::iterators::StorageIterator;
 use crate::iterators::concat_iterator::SstConcatIterator;
 use crate::iterators::merge_iterator::MergeIterator;
 use crate::iterators::two_merge_iterator::TwoMergeIterator;
+use crate::key::KeySlice;
 use crate::lsm_storage::{LsmStorageInner, LsmStorageState};
 use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
+
+enum SsTableIteratorWrapper {
+    Merge(MergeIterator<SsTableIterator>),
+    Concat(SstConcatIterator),
+}
+
+// Implement StorageIterator for the wrapper
+impl StorageIterator for SsTableIteratorWrapper {
+    type KeyType<'a> = KeySlice<'a>;
+
+    fn value(&self) -> &[u8] {
+        match self {
+            Self::Merge(iter) => iter.value(),
+            Self::Concat(iter) => iter.value(),
+        }
+    }
+
+    fn key(&self) -> KeySlice {
+        match self {
+            Self::Merge(iter) => iter.key(),
+            Self::Concat(iter) => iter.key(),
+        }
+    }
+
+    fn is_valid(&self) -> bool {
+        match self {
+            Self::Merge(iter) => iter.is_valid(),
+            Self::Concat(iter) => iter.is_valid(),
+        }
+    }
+
+    fn next(&mut self) -> Result<()> {
+        match self {
+            Self::Merge(iter) => iter.next(),
+            Self::Concat(iter) => iter.next(),
+        }
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum CompactionTask {
@@ -161,7 +200,7 @@ impl LsmStorageInner {
                         }
                     }
                     // For L0 SSTs use MergeIterator since they may overlap
-                    MergeIterator::create(l0_iters)
+                    SsTableIteratorWrapper::Merge(MergeIterator::create(l0_iters))
                 };
 
                 // Add L1 SSTs
@@ -173,11 +212,53 @@ impl LsmStorageInner {
                         }
                     }
                     // For L1 SSTs use ConcatIterator since they are sorted and non-overlapping
-                    SstConcatIterator::create_and_seek_to_first(l1_ssts)?
+                    SsTableIteratorWrapper::Concat(SstConcatIterator::create_and_seek_to_first(
+                        l1_ssts,
+                    )?)
                 };
 
                 // Create merge iterator
                 TwoMergeIterator::create(l0_iter, l1_iter)?
+            }
+            CompactionTask::Simple(task) => {
+                // For upper level
+                let upper_iter = if task.upper_level.is_none() {
+                    // L0 -> L1 case
+                    let mut l0_iters = Vec::new();
+                    for &sst_id in &task.upper_level_sst_ids {
+                        if let Some(sst) = snapshot.sstables.get(&sst_id) {
+                            l0_iters.push(Box::new(SsTableIterator::create_and_seek_to_first(
+                                Arc::clone(sst),
+                            )?));
+                        }
+                    }
+                    SsTableIteratorWrapper::Merge(MergeIterator::create(l0_iters))
+                } else {
+                    // Ln -> L(n+1) case
+                    let mut upper_ssts = Vec::new();
+                    for &sst_id in &task.upper_level_sst_ids {
+                        if let Some(sst) = snapshot.sstables.get(&sst_id) {
+                            upper_ssts.push(Arc::clone(sst));
+                        }
+                    }
+                    SsTableIteratorWrapper::Concat(SstConcatIterator::create_and_seek_to_first(
+                        upper_ssts,
+                    )?)
+                };
+
+                // For lower level (always use ConcatIterator as they're sorted)
+                let mut lower_ssts = Vec::new();
+                for &sst_id in &task.lower_level_sst_ids {
+                    if let Some(sst) = snapshot.sstables.get(&sst_id) {
+                        lower_ssts.push(Arc::clone(sst));
+                    }
+                }
+                let lower_iter = SsTableIteratorWrapper::Concat(
+                    SstConcatIterator::create_and_seek_to_first(lower_ssts)?,
+                );
+
+                // Create merge iterator
+                TwoMergeIterator::create(upper_iter, lower_iter)?
             }
             _ => {
                 // 对于其他未实现的变体，返回一个错误或执行默认操作
@@ -289,7 +370,57 @@ impl LsmStorageInner {
     }
 
     fn trigger_compaction(&self) -> Result<()> {
-        unimplemented!()
+        // Take a snapshot of current state
+        let snapshot = {
+            let state = self.state.read();
+            Arc::clone(&state)
+        };
+
+        // 1. Generate compaction task
+        let task = match self
+            .compaction_controller
+            .generate_compaction_task(&snapshot)
+        {
+            Some(task) => task,
+            None => return Ok(()), // No compaction needed
+        };
+        // print LSM structure after compaction
+        self.dump_structure();
+        println!("trigger compaction: {:?}", task);
+
+        // 2. Run compaction
+        let new_ssts = self.compact(&task)?;
+
+        // 3. Update LSM state with compaction results
+        {
+            let _state_lock = self.state_lock.lock();
+            let snapshot = self.state.read().as_ref().clone();
+
+            // Apply compaction result and get removed SSTs
+            let (snapshot, removed_sst_ids) = self.compaction_controller.apply_compaction_result(
+                &snapshot,
+                &task,
+                &new_ssts.iter().map(|sst| sst.sst_id()).collect::<Vec<_>>(),
+                false,
+            );
+
+            // Add new SSTs to the state
+            let mut final_state = snapshot;
+            for sst in new_ssts {
+                final_state.sstables.insert(sst.sst_id(), sst);
+            }
+
+            // Update state atomically
+            let mut state = self.state.write();
+            *state = Arc::new(final_state);
+
+            println!("compaction done, removed SSTs: {:?}", removed_sst_ids);
+        }
+
+        // Sync directory after state update
+        self.sync_dir()?;
+
+        Ok(())
     }
 
     pub(crate) fn spawn_compaction_thread(
