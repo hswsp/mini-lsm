@@ -427,7 +427,7 @@ impl LsmStorageInner {
             return Ok(());
         }
         // 检查 immutable memtables 数量是否达到限制
-        if self.state.read().imm_memtables.len() + 1 > self.options.num_memtable_limit {
+        if self.state.read().imm_memtables.len() + 1 >= self.options.num_memtable_limit {
             // Flush one immutable memtable to make room
             self.force_flush_next_imm_memtable()?;
         }
