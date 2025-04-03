@@ -38,40 +38,54 @@ use crate::key::KeySlice;
 use crate::lsm_storage::{LsmStorageInner, LsmStorageState};
 use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
 
-enum SsTableIteratorWrapper {
-    Merge(MergeIterator<SsTableIterator>),
-    Concat(SstConcatIterator),
+/// Wrapper for SsTableIterator to implement StorageIterator
+/// Rust 无法将具有泛型关联类型的 trait 用作 trait object
+/// 这里使用枚举将所有可能的类型包装起来
+enum SsTableIteratorWrapper<I>
+where
+    I: 'static + for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>,
+{
+    AllConcat(MergeIterator<SstConcatIterator>),
+    MergeConcat(TwoMergeIterator<MergeIterator<I>, SstConcatIterator>),
+    TwoConcat(TwoMergeIterator<SstConcatIterator, SstConcatIterator>),
 }
 
 // Implement StorageIterator for the wrapper
-impl StorageIterator for SsTableIteratorWrapper {
+impl<I> StorageIterator for SsTableIteratorWrapper<I>
+where
+    I: 'static + for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>,
+{
     type KeyType<'a> = KeySlice<'a>;
 
     fn value(&self) -> &[u8] {
         match self {
-            Self::Merge(iter) => iter.value(),
-            Self::Concat(iter) => iter.value(),
+            Self::AllConcat(iter) => iter.value(),
+            Self::TwoConcat(iter) => iter.value(),
+            Self::MergeConcat(iter) => iter.value(),
         }
     }
 
-    fn key(&self) -> KeySlice {
+    fn key(&self) -> Self::KeyType<'_> {
         match self {
-            Self::Merge(iter) => iter.key(),
-            Self::Concat(iter) => iter.key(),
+            Self::AllConcat(iter) => iter.key(),
+            Self::TwoConcat(iter) => iter.key(),
+            Self::MergeConcat(iter) => iter.key(),
         }
     }
 
     fn is_valid(&self) -> bool {
         match self {
-            Self::Merge(iter) => iter.is_valid(),
-            Self::Concat(iter) => iter.is_valid(),
+            Self::AllConcat(iter) => iter.is_valid(),
+            Self::TwoConcat(iter) => iter.is_valid(),
+            Self::MergeConcat(iter) => iter.is_valid(),
         }
     }
 
     fn next(&mut self) -> Result<()> {
         match self {
-            Self::Merge(iter) => iter.next(),
-            Self::Concat(iter) => iter.next(),
+            Self::AllConcat(iter) => iter.next(),
+            Self::TwoConcat(iter) => iter.next(),
+            Self::MergeConcat(iter) => iter.next(),
         }
     }
 }
@@ -200,7 +214,7 @@ impl LsmStorageInner {
                         }
                     }
                     // For L0 SSTs use MergeIterator since they may overlap
-                    SsTableIteratorWrapper::Merge(MergeIterator::create(l0_iters))
+                    MergeIterator::create(l0_iters)
                 };
 
                 // Add L1 SSTs
@@ -212,17 +226,24 @@ impl LsmStorageInner {
                         }
                     }
                     // For L1 SSTs use ConcatIterator since they are sorted and non-overlapping
-                    SsTableIteratorWrapper::Concat(SstConcatIterator::create_and_seek_to_first(
-                        l1_ssts,
-                    )?)
+                    SstConcatIterator::create_and_seek_to_first(l1_ssts)?
                 };
 
                 // Create merge iterator
-                TwoMergeIterator::create(l0_iter, l1_iter)?
+                SsTableIteratorWrapper::MergeConcat(TwoMergeIterator::create(l0_iter, l1_iter)?)
             }
             CompactionTask::Simple(task) => {
+                // For lower level (always use ConcatIterator as they're sorted)
+                let mut lower_ssts = Vec::new();
+                for &sst_id in &task.lower_level_sst_ids {
+                    if let Some(sst) = snapshot.sstables.get(&sst_id) {
+                        lower_ssts.push(Arc::clone(sst));
+                    }
+                }
+                let lower_iter = SstConcatIterator::create_and_seek_to_first(lower_ssts)?;
+
                 // For upper level
-                let upper_iter = if task.upper_level.is_none() {
+                if task.upper_level.is_none() {
                     // L0 -> L1 case
                     let mut l0_iters = Vec::new();
                     for &sst_id in &task.upper_level_sst_ids {
@@ -232,7 +253,11 @@ impl LsmStorageInner {
                             )?));
                         }
                     }
-                    SsTableIteratorWrapper::Merge(MergeIterator::create(l0_iters))
+                    let upper_iter = MergeIterator::create(l0_iters);
+                    // Create merge iterator
+                    SsTableIteratorWrapper::MergeConcat(TwoMergeIterator::create(
+                        upper_iter, lower_iter,
+                    )?)
                 } else {
                     // Ln -> L(n+1) case
                     let mut upper_ssts = Vec::new();
@@ -241,28 +266,41 @@ impl LsmStorageInner {
                             upper_ssts.push(Arc::clone(sst));
                         }
                     }
-                    SsTableIteratorWrapper::Concat(SstConcatIterator::create_and_seek_to_first(
-                        upper_ssts,
+                    let upper_iter = SstConcatIterator::create_and_seek_to_first(upper_ssts)?;
+                    // Create merge iterator
+                    SsTableIteratorWrapper::TwoConcat(TwoMergeIterator::create(
+                        upper_iter, lower_iter,
                     )?)
-                };
+                }
+            }
+            CompactionTask::Tiered(task) => {
+                // Create iterators for all tiers
+                let mut tier_iters = Vec::new();
 
-                // For lower level (always use ConcatIterator as they're sorted)
-                let mut lower_ssts = Vec::new();
-                for &sst_id in &task.lower_level_sst_ids {
-                    if let Some(sst) = snapshot.sstables.get(&sst_id) {
-                        lower_ssts.push(Arc::clone(sst));
+                // Process each tier in order
+                for (_, tier_ssts) in &task.tiers {
+                    // Create iterators for current tiers
+                    let mut tier_ssts_refs = Vec::new();
+                    for &sst_id in tier_ssts {
+                        if let Some(sst) = snapshot.sstables.get(&sst_id) {
+                            tier_ssts_refs.push(Arc::clone(sst));
+                        }
+                    }
+
+                    // Each tier should use ConcatIterator since SSTs within a tier are sorted and non-overlapping
+                    if !tier_ssts_refs.is_empty() {
+                        let iter = SstConcatIterator::create_and_seek_to_first(tier_ssts_refs)?;
+                        tier_iters.push(Box::new(iter));
                     }
                 }
-                let lower_iter = SsTableIteratorWrapper::Concat(
-                    SstConcatIterator::create_and_seek_to_first(lower_ssts)?,
-                );
 
-                // Create merge iterator
-                TwoMergeIterator::create(upper_iter, lower_iter)?
+                // Create a merge iterator combining all tier iterators
+                // Since tiers may overlap with each other, we use MergeIterator
+                SsTableIteratorWrapper::AllConcat(MergeIterator::create(tier_iters))
             }
             _ => {
                 // 对于其他未实现的变体，返回一个错误或执行默认操作
-                return Err(anyhow::anyhow!("Compaction task type not implemented"));
+                unimplemented!("Compaction task type not implemented")
             }
         };
 

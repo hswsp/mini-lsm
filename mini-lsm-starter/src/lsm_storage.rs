@@ -549,30 +549,33 @@ impl LsmStorageInner {
                     return Ok(());
                 }
                 // Create new state with modifications
-                let new_state = Arc::new(LsmStorageState {
+                let mut new_state = LsmStorageState {
                     memtable: state.memtable.clone(),
                     imm_memtables: {
                         let mut new_imm = state.imm_memtables.clone();
                         new_imm.pop(); // Remove the last memtable
                         new_imm
                     },
-                    l0_sstables: {
-                        let mut new_l0 = Vec::with_capacity(state.l0_sstables.len() + 1);
-                        new_l0.push(sst_id); // Add newest SST first
-                        new_l0.extend(state.l0_sstables.iter().cloned()); // Add existing SSTs
-                        new_l0
-                    },
+                    l0_sstables: state.l0_sstables.clone(),
                     levels: state.levels.clone(),
                     sstables: {
                         let mut new_sst = state.sstables.clone();
                         new_sst.insert(sst_id, sst.clone());
                         new_sst
                     },
-                });
+                };
 
+                // Add SST based on compaction strategy
+                if self.compaction_controller.flush_to_l0() {
+                    // Add to L0 if using leveled compaction
+                    new_state.l0_sstables.insert(0, sst_id);
+                } else {
+                    // Add as new tier if using tiered compaction
+                    new_state.levels.push((sst_id, vec![sst_id]));
+                }
                 // Replace the old state with the new one
                 println!("flushed {}.sst with size={}", sst_id, sst.table_size());
-                *state = new_state;
+                *state = Arc::new(new_state);
             }
         }
 
