@@ -145,7 +145,7 @@ impl SimpleLeveledCompactionController {
 
         let mut removed_sst_ids = Vec::new();
 
-        // Convert SST IDs to HashSet for O(1) lookup
+         // Convert SST IDs to HashSet for O(1) lookup
         let upper_sst_set: HashSet<_> = _task.upper_level_sst_ids.iter().copied().collect();
         let lower_sst_set: HashSet<_> = _task.lower_level_sst_ids.iter().copied().collect();
 
@@ -168,13 +168,17 @@ impl SimpleLeveledCompactionController {
 
             // Regular level compaction (Ln -> Ln+1)
             Some(upper_level) => {
+                // Collect SSTs to remove
+                removed_sst_ids.extend(_task.upper_level_sst_ids.iter().cloned());
+                removed_sst_ids.extend(_task.lower_level_sst_ids.iter().cloned());
+
                 // Update upper level (Ln)
                 if let Some((_, ssts)) = new_state
                     .levels
                     .iter_mut()
                     .find(|(lvl, _)| *lvl == upper_level)
                 {
-                    ssts.retain(|sst_id| !upper_sst_set.contains(sst_id));
+                    ssts.retain(|sst_id| !_task.upper_level_sst_ids.contains(sst_id));
                 }
 
                 // Update lower level (Ln+1)
@@ -184,13 +188,13 @@ impl SimpleLeveledCompactionController {
                     .find(|(lvl, _)| *lvl == _task.lower_level)
                 {
                     // Keep SSTs that were not compacted
-                    ssts.retain(|sst_id| !lower_sst_set.contains(sst_id));
+                    ssts.retain(|sst_id| !_task.lower_level_sst_ids.contains(sst_id));
                     // Add newly generated SSTs
                     ssts.extend(_output.iter().cloned());
                 }
             }
         }
-
+        
         // Collect SSTs to remove
         removed_sst_ids.extend(_task.upper_level_sst_ids.iter().cloned());
         removed_sst_ids.extend(_task.lower_level_sst_ids.iter().cloned());

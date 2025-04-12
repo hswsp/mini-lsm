@@ -145,7 +145,7 @@ impl SimpleLeveledCompactionController {
 
         let mut removed_sst_ids = Vec::new();
 
-        // Convert SST IDs to HashSet for O(1) lookup
+         // Convert SST IDs to HashSet for O(1) lookup
         let upper_sst_set: HashSet<_> = _task.upper_level_sst_ids.iter().copied().collect();
         let lower_sst_set: HashSet<_> = _task.lower_level_sst_ids.iter().copied().collect();
 

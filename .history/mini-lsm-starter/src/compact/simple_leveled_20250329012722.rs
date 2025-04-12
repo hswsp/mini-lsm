@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashSet;
-
 use serde::{Deserialize, Serialize};
 
 use crate::lsm_storage::LsmStorageState;
@@ -141,26 +139,32 @@ impl SimpleLeveledCompactionController {
         _task: &SimpleLeveledCompactionTask,
         _output: &[usize],
     ) -> (LsmStorageState, Vec<usize>) {
-        let mut new_state = _snapshot.clone();
+        let mut new_state = LsmStorageState {
+            memtable: _snapshot.memtable.clone(),
+            imm_memtables: _snapshot.imm_memtables.clone(),
+            l0_sstables: _snapshot.l0_sstables.clone(),
+            levels: _snapshot.levels.clone(),
+            sstables: _snapshot.sstables.clone(),
+        };
 
         let mut removed_sst_ids = Vec::new();
-
-        // Convert SST IDs to HashSet for O(1) lookup
-        let upper_sst_set: HashSet<_> = _task.upper_level_sst_ids.iter().copied().collect();
-        let lower_sst_set: HashSet<_> = _task.lower_level_sst_ids.iter().copied().collect();
 
         match _task.upper_level {
             // L0 -> L1 compaction
             None => {
+                // Collect SSTs to remove
+                removed_sst_ids.extend(_task.upper_level_sst_ids.iter().cloned());
+                removed_sst_ids.extend(_task.lower_level_sst_ids.iter().cloned());
+
                 // Remove compacted L0 SSTs
                 new_state
                     .l0_sstables
-                    .retain(|sst_id| !upper_sst_set.contains(sst_id));
+                    .retain(|sst_id| !_task.upper_level_sst_ids.contains(sst_id));
 
                 // Update L1 (index 0 in levels map)
                 if let Some((_, ssts)) = new_state.levels.first_mut() {
                     // Keep SSTs that were not compacted
-                    ssts.retain(|sst_id| !lower_sst_set.contains(sst_id));
+                    ssts.retain(|sst_id| !_task.lower_level_sst_ids.contains(sst_id));
                     // Add newly generated SSTs
                     ssts.extend(_output.iter().cloned());
                 }
@@ -168,13 +172,17 @@ impl SimpleLeveledCompactionController {
 
             // Regular level compaction (Ln -> Ln+1)
             Some(upper_level) => {
+                // Collect SSTs to remove
+                removed_sst_ids.extend(_task.upper_level_sst_ids.iter().cloned());
+                removed_sst_ids.extend(_task.lower_level_sst_ids.iter().cloned());
+
                 // Update upper level (Ln)
                 if let Some((_, ssts)) = new_state
                     .levels
                     .iter_mut()
                     .find(|(lvl, _)| *lvl == upper_level)
                 {
-                    ssts.retain(|sst_id| !upper_sst_set.contains(sst_id));
+                    ssts.retain(|sst_id| !_task.upper_level_sst_ids.contains(sst_id));
                 }
 
                 // Update lower level (Ln+1)
@@ -184,16 +192,13 @@ impl SimpleLeveledCompactionController {
                     .find(|(lvl, _)| *lvl == _task.lower_level)
                 {
                     // Keep SSTs that were not compacted
-                    ssts.retain(|sst_id| !lower_sst_set.contains(sst_id));
+                    ssts.retain(|sst_id| !_task.lower_level_sst_ids.contains(sst_id));
                     // Add newly generated SSTs
                     ssts.extend(_output.iter().cloned());
                 }
             }
         }
 
-        // Collect SSTs to remove
-        removed_sst_ids.extend(_task.upper_level_sst_ids.iter().cloned());
-        removed_sst_ids.extend(_task.lower_level_sst_ids.iter().cloned());
         (new_state, removed_sst_ids)
     }
 }

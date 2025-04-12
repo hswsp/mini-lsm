@@ -439,7 +439,7 @@ impl LsmStorageInner {
             let _state_lock = self.state_lock.lock();
             let mut snapshot = self.state.read().as_ref().clone();
 
-            // First insert new SSTs to the state.
+            // First insert new SSTs to the state. 
             // In LeveledCompactionTask we need first_keys in sst.
             for sst in &new_ssts {
                 snapshot.sstables.insert(sst.sst_id(), Arc::clone(sst));

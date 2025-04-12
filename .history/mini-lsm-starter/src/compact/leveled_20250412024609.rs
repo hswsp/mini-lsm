@@ -239,42 +239,78 @@ impl LeveledCompactionController {
     ) -> (LsmStorageState, Vec<usize>) {
         let mut new_state = _snapshot.clone();
         let mut files_to_remove = Vec::new();
-        // Convert SST IDs to HashSet for O(1) lookup
-        let upper_sst_set: HashSet<_> = _task.upper_level_sst_ids.iter().copied().collect();
-        let lower_sst_set: HashSet<_> = _task.lower_level_sst_ids.iter().copied().collect();
 
-        // Handle upper level (L0 or Ln)
-        match _task.upper_level {
-            Some(upper_level) => {
-                new_state.levels[upper_level - 1]
-                    .1
-                    .retain(|sst_id| !upper_sst_set.contains(sst_id));
-            }
-            None => {
-                new_state
-                    .l0_sstables
-                    .retain(|sst_id| !upper_sst_set.contains(sst_id));
-            }
-        }
-
-        // Handle lower level and sort if needed
-        let lower_idx = _task.lower_level - 1;
-        new_state.levels[lower_idx]
-            .1
-            .retain(|sst_id| !lower_sst_set.contains(sst_id));
-
-        new_state.levels[lower_idx].1.extend(_output);
-
-        // Sort by first keys if not L0 and not in recovery
-        if !_in_recovery && _task.lower_level != 0 {
-            new_state.levels[lower_idx]
+        let mut upper_level_sst_ids_set = _task
+            .upper_level_sst_ids
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        let mut lower_level_sst_ids_set = _task
+            .lower_level_sst_ids
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        // upper_level考虑是否compact l0
+        if let Some(upper_level) = _task.upper_level {
+            let new_upper_level_ssts = new_state.levels[upper_level - 1]
                 .1
-                .sort_by_cached_key(|sst_id| new_state.sstables[sst_id].first_key().clone());
+                .iter()
+                .filter_map(|x| {
+                    //_task 中存在的要删除
+                    if upper_level_sst_ids_set.remove(x) {
+                        return None;
+                    }
+                    Some(*x)
+                })
+                .collect::<Vec<_>>();
+            assert!(upper_level_sst_ids_set.is_empty());
+            new_state.levels[upper_level - 1].1 = new_upper_level_ssts;
+        } else {
+            let new_l0_ssts = new_state
+                .l0_sstables
+                .iter()
+                .filter_map(|x| {
+                    if upper_level_sst_ids_set.remove(x) {
+                        return None;
+                    }
+                    Some(*x)
+                })
+                .collect::<Vec<_>>();
+            assert!(upper_level_sst_ids_set.is_empty());
+            new_state.l0_sstables = new_l0_ssts;
         }
 
-        // Add all removed files to the result
         files_to_remove.extend(&_task.upper_level_sst_ids);
         files_to_remove.extend(&_task.lower_level_sst_ids);
+
+        let mut new_lower_level_ssts = new_state.levels[_task.lower_level - 1]
+            .1
+            .iter()
+            .filter_map(|x| {
+                if lower_level_sst_ids_set.remove(x) {
+                    return None;
+                }
+                Some(*x)
+            })
+            .collect::<Vec<_>>();
+        assert!(lower_level_sst_ids_set.is_empty());
+        new_lower_level_ssts.extend(_output);
+
+        // Don't sort the SST IDs during recovery because actual SSTs are not loaded at that point
+        if !_in_recovery{
+            // Note that you should keep SST ids ordered by first keys in all levels except L0.
+            new_lower_level_ssts.sort_by(|x, y| {
+                new_state
+                    .sstables
+                    .get(x)
+                    .unwrap()
+                    .first_key()
+                    .cmp(new_state.sstables.get(y).unwrap().first_key())
+            });
+
+        }
+       
+        new_state.levels[_task.lower_level - 1].1 = new_lower_level_ssts;
         (new_state, files_to_remove)
     }
 }

@@ -437,25 +437,29 @@ impl LsmStorageInner {
         // 3. Update LSM state with compaction results
         {
             let _state_lock = self.state_lock.lock();
-            let mut snapshot = self.state.read().as_ref().clone();
+            let snapshot = self.state.read().as_ref().clone();
 
-            // First insert new SSTs to the state.
-            // In LeveledCompactionTask we need first_keys in sst.
-            for sst in &new_ssts {
-                snapshot.sstables.insert(sst.sst_id(), Arc::clone(sst));
-            }
-
-            // Then Apply compaction result and get removed SSTs
-            let (new_state, removed_sst_ids) = self.compaction_controller.apply_compaction_result(
+            // First insert new SSTs so their first_keys are available
+        for sst in &new_ssts {
+            snapshot.sstables.insert(sst.sst_id(), Arc::clone(sst));
+        }
+            // Apply compaction result and get removed SSTs
+            let (snapshot, removed_sst_ids) = self.compaction_controller.apply_compaction_result(
                 &snapshot,
                 &task,
                 &new_ssts.iter().map(|sst| sst.sst_id()).collect::<Vec<_>>(),
                 false,
             );
 
+            // Add new SSTs to the state
+            let mut final_state = snapshot;
+            for sst in new_ssts {
+                final_state.sstables.insert(sst.sst_id(), sst);
+            }
+
             // Update state atomically
             let mut state = self.state.write();
-            *state = Arc::new(new_state);
+            *state = Arc::new(final_state);
 
             println!("compaction done, removed SSTs: {:?}", removed_sst_ids);
         }

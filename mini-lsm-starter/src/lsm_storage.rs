@@ -571,7 +571,7 @@ impl LsmStorageInner {
                     new_state.l0_sstables.insert(0, sst_id);
                 } else {
                     // Add as new tier if using tiered compaction
-                    new_state.levels.push((sst_id, vec![sst_id]));
+                    new_state.levels.insert(0, (sst_id, vec![sst_id]));
                 }
                 // Replace the old state with the new one
                 println!("flushed {}.sst with size={}", sst_id, sst.table_size());

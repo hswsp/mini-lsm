@@ -239,42 +239,34 @@ impl LeveledCompactionController {
     ) -> (LsmStorageState, Vec<usize>) {
         let mut new_state = _snapshot.clone();
         let mut files_to_remove = Vec::new();
-        // Convert SST IDs to HashSet for O(1) lookup
-        let upper_sst_set: HashSet<_> = _task.upper_level_sst_ids.iter().copied().collect();
-        let lower_sst_set: HashSet<_> = _task.lower_level_sst_ids.iter().copied().collect();
-
         // Handle upper level (L0 or Ln)
         match _task.upper_level {
             Some(upper_level) => {
-                new_state.levels[upper_level - 1]
-                    .1
-                    .retain(|sst_id| !upper_sst_set.contains(sst_id));
+                new_state.levels[upper_level - 1].1.retain(|sst_id| 
+                    !_task.upper_level_sst_ids.contains(sst_id));
             }
             None => {
-                new_state
-                    .l0_sstables
-                    .retain(|sst_id| !upper_sst_set.contains(sst_id));
+                new_state.l0_sstables.retain(|sst_id| 
+                    !_task.upper_level_sst_ids.contains(sst_id));
             }
         }
 
         // Handle lower level and sort if needed
         let lower_idx = _task.lower_level - 1;
-        new_state.levels[lower_idx]
-            .1
-            .retain(|sst_id| !lower_sst_set.contains(sst_id));
-
+        new_state.levels[lower_idx].1.retain(|sst_id| 
+            !_task.lower_level_sst_ids.contains(sst_id));
         new_state.levels[lower_idx].1.extend(_output);
 
         // Sort by first keys if not L0 and not in recovery
         if !_in_recovery && _task.lower_level != 0 {
-            new_state.levels[lower_idx]
-                .1
-                .sort_by_cached_key(|sst_id| new_state.sstables[sst_id].first_key().clone());
+            new_state.levels[lower_idx].1.sort_by_cached_key(|sst_id| 
+                new_state.sstables[sst_id].first_key().clone()
+            );
         }
 
-        // Add all removed files to the result
         files_to_remove.extend(&_task.upper_level_sst_ids);
         files_to_remove.extend(&_task.lower_level_sst_ids);
+
         (new_state, files_to_remove)
     }
 }

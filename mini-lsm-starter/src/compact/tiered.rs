@@ -54,28 +54,32 @@ impl TieredCompactionController {
         if _snapshot.levels.len() < self.options.num_tiers {
             return None;
         }
-        println!("current size_ratio is {}",self.options.size_ratio);
+        println!("current size_ratio is {}", self.options.size_ratio);
         // Calculate prefix sum array for tier sizes
         let mut prefix_sums: Vec<usize> = Vec::with_capacity(_snapshot.levels.len() + 1);
         prefix_sums.push(0); // Start with 0 for easier calculations
 
-        let mut running_sum = 0;       
+        let mut running_sum = 0;
         for (_, ssts) in _snapshot.levels.iter() {
             running_sum += ssts.len();
             prefix_sums.push(running_sum);
         }
 
         // First check: space amplification ratio
-        let last_tier_size = prefix_sums[_snapshot.levels.len()] - prefix_sums[_snapshot.levels.len() - 1];
+        let last_tier_size =
+            prefix_sums[_snapshot.levels.len()] - prefix_sums[_snapshot.levels.len() - 1];
         let other_tiers_size = prefix_sums[_snapshot.levels.len() - 1]; // Sum of all tiers except last
 
-        let last_tier_size = if last_tier_size == 0 { 1 } else { last_tier_size };
+        let last_tier_size = if last_tier_size == 0 {
+            1
+        } else {
+            last_tier_size
+        };
         let space_amp_ratio = other_tiers_size * 100 / last_tier_size;
-        if  space_amp_ratio >= self.options.max_size_amplification_percent {
+        if space_amp_ratio >= self.options.max_size_amplification_percent {
             println!(
                 "tiered compaction triggered by space amplification {}: current space amplification ratio {}",
-                self.options.max_size_amplification_percent,
-                space_amp_ratio
+                self.options.max_size_amplification_percent, space_amp_ratio
             );
             return Some(TieredCompactionTask {
                 tiers: _snapshot.levels.clone(),
@@ -88,21 +92,23 @@ impl TieredCompactionController {
         for id in 1.._snapshot.levels.len() {
             let current_tier_size = prefix_sums[id + 1] - prefix_sums[id];
             let prev_tiers_sum = prefix_sums[id]; // Sum of all previous tiers
-            let ratio = (current_tier_size  as f64) / prev_tiers_sum as f64;
-    
+            let ratio = (current_tier_size as f64) / prev_tiers_sum as f64;
+
             if ratio > size_ratio_trigger && id >= self.options.min_merge_width {
                 // excluding the current tier
-                let tiers = _snapshot.levels
-                                                                .iter()
-                                                                .take(id)
-                                                                .cloned()
-                                                                .collect::<Vec<_>>();
+                let tiers = _snapshot
+                    .levels
+                    .iter()
+                    .take(id)
+                    .cloned()
+                    .collect::<Vec<_>>();
 
                 println!(
-                    "tiered compaction triggered by size ratio {}%: current size ratio {}%", 
-                    size_ratio_trigger * 100.0, 
-                    ratio * 100.0);
-               
+                    "tiered compaction triggered by size ratio {}%: current size ratio {}%",
+                    size_ratio_trigger * 100.0,
+                    ratio * 100.0
+                );
+
                 return Some(TieredCompactionTask {
                     tiers,
                     bottom_tier_included: id >= _snapshot.levels.len(), // excluding the current tier, acutally should alaways be false
@@ -157,33 +163,35 @@ impl TieredCompactionController {
                 .map(|(tier_id, tier_ssts)| (*tier_id, tier_ssts.clone())),
         );
 
-
         // Part 2: Add compaction output as a new tier
         let mut tier_to_remove = _task
-                                    .tiers
-                                    .iter()
-                                    .map(|(x, y)| (*x, y))
-                                    .collect::<HashMap<_, _>>();
+            .tiers
+            .iter()
+            .map(|(x, y)| (*x, y))
+            .collect::<HashMap<_, _>>();
         // Collect SSTs that were compacted
         let mut compacted_ssts = Vec::new();
 
         if !_output.is_empty() {
             // Check if any SSTs in output exist in snapshot with different content
-            for (tier_id, tier_ssts) in &_snapshot.levels{
+            for (tier_id, tier_ssts) in &_snapshot.levels {
                 if let Some(ffiles) = tier_to_remove.remove(tier_id) {
-                   // the tier should be removed
-                    assert_eq!(ffiles, tier_ssts, "file changed after issuing compaction task");
+                    // the tier should be removed
+                    assert_eq!(
+                        ffiles, tier_ssts,
+                        "file changed after issuing compaction task"
+                    );
                     compacted_ssts.extend(ffiles.iter().copied());
                 }
             }
             if new_levels.is_empty() {
                 // use the first output SST id as the level/tier id for your new sorted run
                 new_levels.push((_output[0], _output.to_vec()));
-            }else{
+            } else {
                 new_levels.push((max_compacted_tier_id, _output.to_vec()));
-            }     
+            }
         }
-          
+
         // Part 3: Keep tiers below the compaction range if bottom_tier_included is false
         if !_task.bottom_tier_included {
             let min_compacted_tier_id = _task.tiers.last().map(|(id, _)| *id).unwrap_or(0);
