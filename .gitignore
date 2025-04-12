@@ -1,8 +1,11 @@
-/target
 .vscode/
+.history/
+.DS_Store
+.idea/
+
+
+/target
 sync-tmp/
 mini-lsm.db/
 lsm.db/
 
-.DS_Store
-.idea/
