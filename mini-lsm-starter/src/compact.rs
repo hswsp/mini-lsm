@@ -36,6 +36,7 @@ use crate::iterators::merge_iterator::MergeIterator;
 use crate::iterators::two_merge_iterator::TwoMergeIterator;
 use crate::key::KeySlice;
 use crate::lsm_storage::{LsmStorageInner, LsmStorageState};
+use crate::manifest::ManifestRecord;
 use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
 
 /// Wrapper for SsTableIterator to implement StorageIterator
@@ -187,6 +188,7 @@ impl LsmStorageInner {
             Some(self.block_cache.clone()),
             self.path_of_sst(sst_id),
         )?;
+
         new_ssts.push(Arc::new(sst));
         Ok(())
     }
@@ -365,12 +367,11 @@ impl LsmStorageInner {
 
         println!("force full compaction: {:?}", task);
         let new_ssts = self.compact(&task)?;
-
+        let mut sst_ids = Vec::with_capacity(new_ssts.len());
         // Update state under write lock with state lock protection
         {
             let _state_lock = self.state_lock.lock();
-            let mut state = self.state.write();
-            let mut new_state = state.as_ref().clone();
+            let mut new_state = self.state.read().as_ref().clone();
 
             // Need to consider new L0 files produced when compaction is going on
             // Keep L0 SSTs that were created after we started compaction
@@ -397,14 +398,24 @@ impl LsmStorageInner {
 
             // Update SSTable map with new SSTs
             for sst in new_ssts {
+                sst_ids.push(sst.sst_id());
                 new_state.sstables.insert(sst.sst_id(), sst);
             }
 
+            let mut state = self.state.write();
             *state = Arc::new(new_state);
             println!(
                 "force full compaction done, new SSTs: {:?}",
                 state.levels.first().map(|(_, ssts)| ssts)
             );
+
+            drop(state);
+            self.sync_dir()?;
+
+            self.manifest.as_ref().unwrap().add_record(
+                &_state_lock,
+                ManifestRecord::Compaction(task, sst_ids.clone()),
+            )?;
         }
 
         // Sync directory after state update
@@ -427,40 +438,72 @@ impl LsmStorageInner {
             Some(task) => task,
             None => return Ok(()), // No compaction needed
         };
-        // print LSM structure after compaction
-        self.dump_structure();
+
         println!("trigger compaction: {:?}", task);
+        println!("-------------  print LSM structure before compaction -----------------");
+        self.dump_structure();
 
         // 2. Run compaction
         let new_ssts = self.compact(&task)?;
-
+        let output = new_ssts.iter().map(|x| x.sst_id()).collect::<Vec<_>>();
         // 3. Update LSM state with compaction results
-        {
+        let ssts_to_remove = {
             let _state_lock = self.state_lock.lock();
             let mut snapshot = self.state.read().as_ref().clone();
 
             // First insert new SSTs to the state.
             // In LeveledCompactionTask we need first_keys in sst.
+            let mut new_sst_ids = Vec::new();
             for sst in &new_ssts {
+                new_sst_ids.push(sst.sst_id());
                 snapshot.sstables.insert(sst.sst_id(), Arc::clone(sst));
             }
 
             // Then Apply compaction result and get removed SSTs
-            let (new_state, removed_sst_ids) = self.compaction_controller.apply_compaction_result(
-                &snapshot,
-                &task,
-                &new_ssts.iter().map(|sst| sst.sst_id()).collect::<Vec<_>>(),
-                false,
-            );
+            let (mut new_state, removed_sst_ids) =
+                self.compaction_controller.apply_compaction_result(
+                    &snapshot,
+                    &task,
+                    &new_ssts.iter().map(|sst| sst.sst_id()).collect::<Vec<_>>(),
+                    false,
+                );
+
+            let mut ssts_to_remove = Vec::with_capacity(removed_sst_ids.len());
+            for sst_id in &removed_sst_ids {
+                let result = new_state.sstables.remove(sst_id);
+                assert!(result.is_some(), "cannot remove {}.sst", sst_id);
+                ssts_to_remove.push(result.unwrap());
+            }
 
             // Update state atomically
             let mut state = self.state.write();
             *state = Arc::new(new_state);
 
-            println!("compaction done, removed SSTs: {:?}", removed_sst_ids);
+            drop(state);
+            //  First Sync directory after state update
+            self.sync_dir()?;
+
+            // Write flush manifest record
+            self.manifest
+                .as_ref()
+                .unwrap()
+                .add_record(&_state_lock, ManifestRecord::Compaction(task, new_sst_ids))?;
+
+            ssts_to_remove
+        };
+
+        println!(
+            "compaction done: {} files removed, {} files added, output={:?}",
+            ssts_to_remove.len(),
+            output.len(),
+            output
+        );
+
+        for sst in ssts_to_remove {
+            std::fs::remove_file(self.path_of_sst(sst.sst_id()))?;
         }
 
-        // Sync directory after state update
+        // sync the manifest
         self.sync_dir()?;
 
         Ok(())

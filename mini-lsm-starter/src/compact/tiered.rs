@@ -50,10 +50,12 @@ impl TieredCompactionController {
         if _snapshot.levels.is_empty() {
             return None;
         }
+
         // If less than num_tiers, no compaction needed
         if _snapshot.levels.len() < self.options.num_tiers {
             return None;
         }
+
         println!("current size_ratio is {}", self.options.size_ratio);
         // Calculate prefix sum array for tier sizes
         let mut prefix_sums: Vec<usize> = Vec::with_capacity(_snapshot.levels.len() + 1);
@@ -184,12 +186,20 @@ impl TieredCompactionController {
                     compacted_ssts.extend(ffiles.iter().copied());
                 }
             }
-            if new_levels.is_empty() {
-                // use the first output SST id as the level/tier id for your new sorted run
-                new_levels.push((_output[0], _output.to_vec()));
-            } else {
-                new_levels.push((max_compacted_tier_id, _output.to_vec()));
-            }
+
+            // 考虑一种情况，假设当前LSM:
+            // L4 (1): [4]
+            // L3 (1): [3]
+            // L2 (3): [5, 6, 7]
+            // task tiers: [(4, [4]), (3, [3])
+            // 这个时候memtable的ID是8。假设compact的时候新生成的sst_id就是[10, 11]
+            // 之后再flush memtable的时候，根据flush immemtable的规则中
+            // let sst_id = memtable_to_flush.id();
+            // 所以新flush的level为8（L8 (1): [8]）
+            // 我们要保证compact的level id 比这个8小！我们可以用被压缩前最大的编号作为新想level的编号。
+
+            // use the max compacted tier id as your new sorted run's level/tier id
+            new_levels.push((max_compacted_tier_id, _output.to_vec()));
         }
 
         // Part 3: Keep tiers below the compaction range if bottom_tier_included is false

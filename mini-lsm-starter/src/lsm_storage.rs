@@ -15,13 +15,13 @@
 #![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use bytes::Bytes;
 use parking_lot::{Mutex, MutexGuard, RwLock};
 
@@ -34,8 +34,9 @@ use crate::iterators::StorageIterator;
 use crate::iterators::concat_iterator::SstConcatIterator;
 use crate::iterators::two_merge_iterator::TwoMergeIterator;
 use crate::key::KeySlice;
+use crate::manifest::ManifestRecord;
 use crate::mem_table::map_bound;
-use crate::table::{SsTableBuilder, SsTableIterator};
+use crate::table::{FileObject, SsTableBuilder, SsTableIterator};
 use crate::{
     iterators::merge_iterator::MergeIterator,
     lsm_iterator::{FusedIterator, LsmIterator},
@@ -200,9 +201,13 @@ impl MiniLsm {
         }
 
         // Flush any remaining data in memtables
+        // create memtable and skip updating manifest
         if !self.inner.state.read().memtable.is_empty() {
+            // 因为最后生成的memtable已经不再使用，无需update manifest
             self.inner
-                .force_freeze_memtable(&self.inner.state_lock.lock())?;
+                .update_imm_memtable_for_freeze(Arc::new(MemTable::create(
+                    self.inner.next_sst_id(),
+                )))?;
         }
         while !self.inner.state.read().imm_memtables.is_empty() {
             self.inner.force_flush_next_imm_memtable()?;
@@ -319,13 +324,16 @@ impl LsmStorageInner {
     /// Start the storage engine by either loading an existing directory or creating a new one if the directory does
     /// not exist.
     pub(crate) fn open(path: impl AsRef<Path>, options: LsmStorageOptions) -> Result<Self> {
+        let mut state = LsmStorageState::create(&options);
+        let manifest;
+        let mut next_sst_id = 1;
+        let block_cache = Arc::new(BlockCache::new(1 << 20)); // 4GB block cache,
+
         let path = path.as_ref();
         // Create the directory if it doesn't exist
         if !path.exists() {
             std::fs::create_dir_all(path)?;
         }
-
-        let state = LsmStorageState::create(&options);
 
         let compaction_controller = match &options.compaction_options {
             CompactionOptions::Leveled(options) => {
@@ -340,19 +348,93 @@ impl LsmStorageInner {
             CompactionOptions::NoCompaction => CompactionController::NoCompaction,
         };
 
+        // The manifest file should be written to <path>/MANIFEST.
+        let manifest_path = path.join("MANIFEST");
+        if !manifest_path.exists() {
+            // create a new manifest file
+            manifest = Manifest::create(&manifest_path).context("failed to create manifest")?;
+            manifest.add_record_when_init(ManifestRecord::NewMemtable(state.memtable.id()))?;
+        } else {
+            // recover the engine state from the manifest file
+            let (m, records) = Manifest::recover(&manifest_path)?;
+            let mut memtables = HashSet::new();
+            // first generate the list of SSTs you will need to load
+            for record in records {
+                match record {
+                    ManifestRecord::Flush(sst_id) => {
+                        let res = memtables.remove(&sst_id);
+                        assert!(res, "memtable {:05} not exist?", sst_id);
+                        if compaction_controller.flush_to_l0() {
+                            state.l0_sstables.insert(0, sst_id);
+                        } else {
+                            state.levels.insert(0, (sst_id, vec![sst_id]));
+                        }
+                        // compute the maximum SST id and update the next_sst_id field.
+                        next_sst_id = next_sst_id.max(sst_id);
+                    }
+                    ManifestRecord::NewMemtable(x) => {
+                        next_sst_id = next_sst_id.max(x);
+                        memtables.insert(x);
+                    }
+                    ManifestRecord::Compaction(task, output) => {
+                        let (new_state, _) = compaction_controller
+                            .apply_compaction_result(&state, &task, &output, true);
+                        // TODO: apply remove again
+                        state = new_state;
+                        next_sst_id =
+                            next_sst_id.max(output.iter().max().copied().unwrap_or_default());
+                    }
+                }
+            }
+
+            let mut sst_cnt = 0;
+            // recover SSTs
+            for table_id in state
+                .l0_sstables
+                .iter()
+                .chain(state.levels.iter().flat_map(|(_, files)| files))
+            {
+                let table_id = *table_id;
+                let sst = SsTable::open(
+                    table_id,
+                    Some(block_cache.clone()),
+                    FileObject::open(&Self::path_of_sst_static(path, table_id))
+                        .with_context(|| format!("failed to open SST: {}", table_id))?,
+                )?;
+                state.sstables.insert(table_id, Arc::new(sst));
+                sst_cnt += 1;
+            }
+            println!("{} SSTs opened", sst_cnt);
+
+            next_sst_id += 1;
+
+            // Sort SSTs on each level (only for leveled compaction)
+            if let CompactionController::Leveled(_) = &compaction_controller {
+                for (_id, ssts) in &mut state.levels {
+                    ssts.sort_by_cached_key(|sst_id| state.sstables[sst_id].first_key().clone());
+                }
+            }
+
+            // recover memtables
+            state.memtable = Arc::new(MemTable::create(next_sst_id));
+            m.add_record_when_init(ManifestRecord::NewMemtable(state.memtable.id()))?;
+            next_sst_id += 1;
+            manifest = m;
+        };
+
         let storage = Self {
             state: Arc::new(RwLock::new(Arc::new(state))),
             state_lock: Mutex::new(()),
             path: path.to_path_buf(),
-            block_cache: Arc::new(BlockCache::new(1024)),
-            next_sst_id: AtomicUsize::new(1),
+            block_cache,
+            next_sst_id: AtomicUsize::new(next_sst_id),
             compaction_controller,
-            manifest: None,
+            manifest: Some(manifest),
             options: options.into(),
             mvcc: None,
             compaction_filters: Arc::new(Mutex::new(Vec::new())),
         };
-
+        storage.sync_dir()?;
         Ok(storage)
     }
 
@@ -491,22 +573,38 @@ impl LsmStorageInner {
         Ok(())
     }
 
-    /// Force freeze the current memtable to an immutable memtable
-    pub fn force_freeze_memtable(&self, _state_lock_observer: &MutexGuard<'_, ()>) -> Result<()> {
-        // 在加锁前创建新的 memtable
-        let new_memtable = Arc::new(MemTable::create(self.next_sst_id()));
-
+    /// Updates the storage state by replacing the current memtable with a new one
+    /// and moving the old memtable to immutable memtables.
+    pub fn update_imm_memtable_for_freeze(&self, new_memtable: Arc<MemTable>) -> Result<()> {
         // 获取写锁来修改状态
         let mut state = self.state.write();
         // Swap the current memtable with a new one.
         let mut snapshot = state.as_ref().clone();
         let old_memtable = std::mem::replace(&mut snapshot.memtable, new_memtable);
 
-        // Add the memtable to the immutable memtables.
+        // Add the memtable to the immutable memtables
         snapshot.imm_memtables.insert(0, old_memtable.clone());
 
-        // 原子地更新状态, 因为 _state_lock_observer 已被持有
+        // Atomically update the state
         *state = Arc::new(snapshot);
+
+        Ok(())
+    }
+
+    /// Force freeze the current memtable to an immutable memtable
+    pub fn force_freeze_memtable(&self, _state_lock_observer: &MutexGuard<'_, ()>) -> Result<()> {
+        // 在加锁前创建新的 memtable
+        let memtable_id = self.next_sst_id();
+        let new_memtable = Arc::new(MemTable::create(memtable_id));
+
+        // Update state with the new memtable
+        self.update_imm_memtable_for_freeze(new_memtable)?;
+
+        self.manifest.as_ref().unwrap().add_record(
+            _state_lock_observer,
+            ManifestRecord::NewMemtable(memtable_id),
+        )?;
+        self.sync_dir()?;
 
         Ok(())
     }
@@ -522,8 +620,9 @@ impl LsmStorageInner {
             state.imm_memtables.last().cloned().unwrap()
         };
 
-        // Create and build SST outside of any locks
-        let sst_id = self.next_sst_id();
+        // Create and build SST outside of any locks.
+        // 注意这里sst_id就是当前memtable的id, 保证manifest记录Flush与NewMemtable一一对应！
+        let sst_id = memtable_to_flush.id();
         let mut builder = SsTableBuilder::new(self.options.block_size);
         memtable_to_flush.flush(&mut builder)?;
 
@@ -532,12 +631,13 @@ impl LsmStorageInner {
             Some(self.block_cache.clone()),
             self.path_of_sst(sst_id),
         )?;
+
         let sst = Arc::new(sst);
         // Update state with write lock
         {
             // Take state lock to ensure only one flush operation at a time
             let _state_lock = self.state_lock.lock();
-            let mut state = self.state.write();
+            let state = self.state.read().as_ref().clone();
             // Double check the memtable is still there and is the same one
             if let Some(last) = state.imm_memtables.last() {
                 if !Arc::ptr_eq(last, &memtable_to_flush) {
@@ -575,8 +675,15 @@ impl LsmStorageInner {
                 }
                 // Replace the old state with the new one
                 println!("flushed {}.sst with size={}", sst_id, sst.table_size());
-                *state = Arc::new(new_state);
+
+                *self.state.write() = Arc::new(new_state);
             }
+
+            // SST flush record stores the SST id that gets flushed to the disk
+            self.manifest
+                .as_ref()
+                .unwrap()
+                .add_record(&_state_lock, ManifestRecord::Flush(sst_id))?;
         }
 
         // Sync directory after releasing the write lock
