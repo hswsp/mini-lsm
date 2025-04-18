@@ -15,12 +15,13 @@
 #![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
+use std::fs::OpenOptions;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::Arc;
 use std::{fs::File, io::Write};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use parking_lot::{Mutex, MutexGuard};
 use serde::{Deserialize, Serialize};
 
@@ -47,21 +48,26 @@ impl Manifest {
     const DEFAULT_COMPACTION_THRESHOLD: usize = 1024 * 1024; // 1MB
 
     pub fn create(_path: impl AsRef<Path>) -> Result<Self> {
-        let file = File::create(_path)?;
         Ok(Self {
-            file: Arc::new(Mutex::new(file)),
+            file: Arc::new(Mutex::new(
+                OpenOptions::new()
+                    .read(true)
+                    .create_new(true)
+                    .write(true)
+                    .open(_path)
+                    .context("failed to create manifest")?,
+            )),
             compaction_threshold: Self::DEFAULT_COMPACTION_THRESHOLD,
         })
     }
 
     pub fn recover(_path: impl AsRef<Path>) -> Result<(Self, Vec<ManifestRecord>)> {
         // Open file for both read and write
-        let file = std::fs::OpenOptions::new()
+        let file = OpenOptions::new()
             .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false) // Explicitly set to false to preserve existing content
-            .open(_path)?;
+            .append(true)
+            .open(_path)
+            .context("failed to recover manifest")?;
 
         // Read entire file content
         let mut reader = BufReader::new(&file);
