@@ -579,32 +579,60 @@ impl LsmStorageInner {
             }
         }
 
-        // 3. 检查 SSTable 层
-        // Create SSTable iterators (outside the critical section)
-        let l0_merge_iter =
-            self.create_l0_sst_iter(&snapshot, Bound::Included(_key), Bound::Included(_key))?;
-        let level_merge_iter = self.create_level_ssts_merge_iterator(
-            &snapshot,
-            Bound::Included(_key),
-            Bound::Included(_key),
-        )?;
-        let merge_iter = TwoMergeIterator::create(l0_merge_iter, level_merge_iter)?;
+        // 3. Check L0 SSTs
+        for &sst_id in snapshot.l0_sstables.iter() {
+            if let Some(sst) = snapshot.sstables.get(&sst_id) {
+                // Skip if key is not in SST range
+                if _key < sst.first_key().raw_ref() || _key > sst.last_key().raw_ref() {
+                    continue;
+                }
 
-        if !merge_iter.is_valid() {
-            return Ok(None);
-        }
+                // Check bloom filter before reading
+                if !sst.may_contain(_key) {
+                    continue;
+                }
 
-        // Check if we found the exact key
-        if merge_iter.key().raw_ref() == _key {
-            let value = merge_iter.value();
-            if value.is_empty() {
-                Ok(None)
-            } else {
-                Ok(Some(Bytes::copy_from_slice(value)))
+                let iter = SsTableIterator::create_and_seek_to_key(
+                    sst.clone(),
+                    KeySlice::from_slice(_key),
+                )?;
+                if iter.is_valid() && iter.key().raw_ref() == _key {
+                    return if iter.value().is_empty() {
+                        Ok(None)
+                    } else {
+                        Ok(Some(Bytes::copy_from_slice(iter.value())))
+                    };
+                }
             }
-        } else {
-            Ok(None)
         }
+        // 4. Check other levels
+        for (_, level_ssts) in &snapshot.levels {
+            for &sst_id in level_ssts {
+                if let Some(sst) = snapshot.sstables.get(&sst_id) {
+                    // Skip if key is not in SST range
+                    if _key < sst.first_key().raw_ref() || _key > sst.last_key().raw_ref() {
+                        continue;
+                    }
+                    // Check bloom filter before reading
+                    if !sst.may_contain(_key) {
+                        continue;
+                    }
+                    let iter = SsTableIterator::create_and_seek_to_key(
+                        sst.clone(),
+                        KeySlice::from_slice(_key),
+                    )?;
+                    if iter.is_valid() && iter.key().raw_ref() == _key {
+                        return if iter.value().is_empty() {
+                            Ok(None)
+                        } else {
+                            Ok(Some(Bytes::copy_from_slice(iter.value())))
+                        };
+                    }
+                }
+            }
+        }
+
+        Ok(None)
     }
 
     fn try_freeze(&self, estimated_size: usize) -> Result<()> {
@@ -627,20 +655,28 @@ impl LsmStorageInner {
     }
     /// Write a batch of data into the storage. Implement in week 2 day 7.
     pub fn write_batch<T: AsRef<[u8]>>(&self, _batch: &[WriteBatchRecord<T>]) -> Result<()> {
-        unimplemented!()
-    }
-
-    /// Put a key-value pair into the storage by writing into the current memtable.
-    pub fn put(&self, _key: &[u8], value: &[u8]) -> Result<()> {
         let estimated_size = {
-            // 获取读锁的作用域
+            // Get read lock scope for initial write to memtable
             let state = self.state.read();
-            // 写入 memtable
-            state.memtable.put(_key, value)?;
-            // 检查是否需要冻结，记录结果
-            state.memtable.approximate_size()
-        }; // 这里读锁就被释放了
 
+            // Process each record in the batch
+            for record in _batch {
+                match record {
+                    WriteBatchRecord::Put(key, value) => {
+                        state.memtable.put(key.as_ref(), value.as_ref())?;
+                    }
+                    WriteBatchRecord::Del(key) => {
+                        // Delete by writing empty value
+                        state.memtable.put(key.as_ref(), &[])?;
+                    }
+                }
+            }
+
+            // Get approximate size after batch write
+            state.memtable.approximate_size()
+        }; // Read lock is released here
+
+        // Check if memtable needs to be frozen after batch write
         // 如果俩线程同时reaches capacity limit.
         // They will both do a size check on the memtable and decide to freeze it.
         // In this case, we might create one empty memtable which is then immediately frozen.
@@ -649,10 +685,14 @@ impl LsmStorageInner {
         Ok(())
     }
 
+    /// Put a key-value pair into the storage by writing into the current memtable.
+    pub fn put(&self, _key: &[u8], value: &[u8]) -> Result<()> {
+        self.write_batch(&[WriteBatchRecord::Put(_key, value)])
+    }
+
     /// Remove a key from the storage by writing an empty value.
     pub fn delete(&self, _key: &[u8]) -> Result<()> {
-        // 写入空值作为删除标记
-        self.put(_key, &[])
+        self.write_batch(&[WriteBatchRecord::Del(_key)])
     }
 
     pub(crate) fn path_of_sst_static(path: impl AsRef<Path>, id: usize) -> PathBuf {

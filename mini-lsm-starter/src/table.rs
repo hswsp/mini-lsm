@@ -26,6 +26,7 @@ use std::sync::Arc;
 use anyhow::Result;
 pub use builder::SsTableBuilder;
 use bytes::Buf;
+use farmhash::fingerprint32;
 pub use iterator::SsTableIterator;
 
 use crate::block::Block;
@@ -119,11 +120,13 @@ impl FileObject {
 
 /// An SSTable.
 /// encoding of SST is like:
-/// -------------------------------------------------------------------------------------------
-/// |         Block Section         |          Meta Section         |          Extra          |
-/// -------------------------------------------------------------------------------------------
-/// | data block | ... | data block |            metadata           | meta block offset (u32) |
-/// -------------------------------------------------------------------------------------------
+/// -----------------------------------------------------------------------------------------------------
+/// |         Block Section         |                            Meta Section                           |
+/// -----------------------------------------------------------------------------------------------------
+/// | data block | ... | data block | metadata | meta block offset | bloom filter | bloom filter offset |
+/// |                               |  varlen  |         u32       |    varlen    |        u32          |
+/// -----------------------------------------------------------------------------------------------------
+///                        block_meta_offset    meta_offset_pos      bloom_offset   bloom_offset_pos
 pub struct SsTable {
     /// The actual storage unit of SsTable, the format is as above.
     pub(crate) file: FileObject,
@@ -149,13 +152,31 @@ impl SsTable {
     /// Open SSTable from a file.
     pub fn open(id: usize, block_cache: Option<Arc<BlockCache>>, file: FileObject) -> Result<Self> {
         let file_size = file.size();
-        let meta_offset = file.read(file_size - 4, 4)?;
+
+        // Read bloom filter offset
+        let bloom_offset_pos = file_size - 4;
+        let bloom_offset_data = file.read(bloom_offset_pos, 4)?;
+        let bloom_offset = u32::from_le_bytes(bloom_offset_data.try_into().unwrap()) as usize;
+
+        // Read meta offset
+        let meta_offset_pos = bloom_offset - 4;
+        let meta_offset = file.read(meta_offset_pos as u64, 4)?;
         let block_meta_offset = u32::from_le_bytes(meta_offset.try_into().unwrap()) as usize;
+
+        // Read block metadata
         let block_meta_data = file.read(
             block_meta_offset as u64,
-            file_size - block_meta_offset as u64 - 4,
+            (meta_offset_pos - block_meta_offset) as u64,
         )?;
         let block_meta = BlockMeta::decode_block_meta(block_meta_data.as_slice());
+
+        // Read bloom filter
+        let bloom_data = file.read(
+            bloom_offset as u64,
+            bloom_offset_pos - (bloom_offset as u64),
+        )?;
+        let bloom = Some(Bloom::decode(&bloom_data)?);
+
         let first_key = block_meta.first().unwrap().first_key.clone();
         let last_key = block_meta.last().unwrap().last_key.clone();
         Ok(Self {
@@ -166,7 +187,7 @@ impl SsTable {
             block_cache,
             first_key,
             last_key,
-            bloom: None,
+            bloom,
             max_ts: 0,
         })
     }
@@ -256,5 +277,13 @@ impl SsTable {
 
     pub fn max_ts(&self) -> u64 {
         self.max_ts
+    }
+
+    // Add may_contain method for bloom filter checks
+    pub fn may_contain(&self, key: &[u8]) -> bool {
+        match &self.bloom {
+            Some(bloom) => bloom.may_contain(fingerprint32(key)),
+            None => true,
+        }
     }
 }

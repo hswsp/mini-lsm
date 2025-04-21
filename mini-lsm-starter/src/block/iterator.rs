@@ -56,6 +56,10 @@ impl BlockIterator {
     /// Creates a block iterator and seek to the first key that >= `key`.
     pub fn create_and_seek_to_key(block: Arc<Block>, key: KeySlice) -> Self {
         let mut iter = Self::new(block);
+        // Initialize first_key before seeking
+        if !iter.block.offsets.is_empty() {
+            iter.first_key = iter.get_first_key_at_offset(iter.block.offsets[0] as usize);
+        }
         iter.seek_to_key(key);
         iter
     }
@@ -116,24 +120,70 @@ impl BlockIterator {
     /// Helper function to get the key at a given index.
     fn get_key(&self, idx: usize) -> KeyVec {
         let offset = self.block.offsets[idx] as usize;
-        let key_len =
+        if idx == 0 {
+            // For first key, read directly without prefix compression
+            self.get_first_key_at_offset(offset)
+        } else {
+            self.get_key_at_offset(offset)
+        }
+    }
+
+    /// Helper function to get the first key at offset without prefix compression
+    fn get_first_key_at_offset(&self, offset: usize) -> KeyVec {
+        // For first key, ignore key_overlap_len as it should be 0
+        let rest_key_len =
+            u16::from_le_bytes(self.block.data[offset + 2..offset + 4].try_into().unwrap())
+                as usize;
+
+        // Read the complete key
+        let key_data = &self.block.data[offset + 4..offset + 4 + rest_key_len];
+        KeyVec::from_vec(key_data.to_vec())
+    }
+
+    /// Helper function to get the key at a given offset
+    fn get_key_at_offset(&self, offset: usize) -> KeyVec {
+        // Read key_overlap_len
+        let key_overlap_len =
             u16::from_le_bytes(self.block.data[offset..offset + 2].try_into().unwrap()) as usize;
-        KeyVec::from_vec(self.block.data[offset + 2..offset + 2 + key_len].to_vec())
+
+        // Read rest_key_len
+        let rest_key_len =
+            u16::from_le_bytes(self.block.data[offset + 2..offset + 4].try_into().unwrap())
+                as usize;
+
+        // Construct full key using overlap
+        let mut full_key = Vec::with_capacity(key_overlap_len + rest_key_len);
+
+        // Add overlapping part from first key
+        if key_overlap_len > 0 {
+            full_key.extend_from_slice(&self.first_key.raw_ref()[..key_overlap_len]);
+        }
+
+        // Add rest of the key
+        full_key.extend_from_slice(&self.block.data[offset + 4..offset + 4 + rest_key_len]);
+
+        KeyVec::from_vec(full_key)
     }
 
     /// Helper function to get the value range at a given index.
     fn get_value_range(&self, idx: usize) -> (usize, usize) {
         let offset = self.block.offsets[idx] as usize;
-        let key_len =
-            u16::from_le_bytes(self.block.data[offset..offset + 2].try_into().unwrap()) as usize;
 
-        let value_offset = offset + 2 + key_len + 2;
+        // Read key_overlap_len and rest_key_len
+        let key_overlap_len =
+            u16::from_le_bytes(self.block.data[offset..offset + 2].try_into().unwrap()) as usize;
+        let rest_key_len =
+            u16::from_le_bytes(self.block.data[offset + 2..offset + 4].try_into().unwrap())
+                as usize;
+
+        // Calculate value position
+        let value_offset = offset + 4 + rest_key_len;
         let value_len = u16::from_le_bytes(
-            self.block.data[value_offset - 2..value_offset]
+            self.block.data[value_offset..value_offset + 2]
                 .try_into()
                 .unwrap(),
         ) as usize;
-        (value_offset, value_offset + value_len)
+        (value_offset + 2, value_offset + 2 + value_len)
     }
 
     /// Helper function to find the position of the first key that is >= `key`.
@@ -141,12 +191,13 @@ impl BlockIterator {
         self.block
             .offsets
             .binary_search_by(|&offset| {
-                let offset = offset as usize;
-                let key_len =
-                    u16::from_le_bytes(self.block.data[offset..offset + 2].try_into().unwrap())
-                        as usize;
-                let probe =
-                    KeyVec::from_vec(self.block.data[offset + 2..offset + 2 + key_len].to_vec());
+                let probe = if offset == self.block.offsets[0] {
+                    // If it's the first offset, use get_first_key_at_offset
+                    self.get_first_key_at_offset(offset as usize)
+                } else {
+                    // For other offsets, use get_key_at_offset
+                    self.get_key_at_offset(offset as usize)
+                };
                 probe.as_key_slice().cmp(&key)
             })
             .unwrap_or_else(|x| x) // Correctly returns the insertion point if the key is not found

@@ -16,13 +16,14 @@
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
 use bytes::Bytes;
+use farmhash::fingerprint32;
 use std::mem;
 use std::path::Path;
 use std::sync::Arc; // Add this import
 
 use anyhow::Result;
 
-use super::{BlockMeta, FileObject, KeyBytes, SsTable};
+use super::{BlockMeta, FileObject, KeyBytes, SsTable, bloom::Bloom};
 use crate::{block::BlockBuilder, key::KeySlice, lsm_storage::BlockCache};
 
 /// Builds an SSTable from key-value pairs.
@@ -33,6 +34,7 @@ pub struct SsTableBuilder {
     data: Vec<u8>,
     pub(crate) meta: Vec<BlockMeta>,
     block_size: usize,
+    key_hashes: Vec<u32>,
 }
 
 impl SsTableBuilder {
@@ -45,6 +47,7 @@ impl SsTableBuilder {
             data: Vec::new(),
             meta: Vec::new(),
             block_size,
+            key_hashes: Vec::new(),
         }
     }
 
@@ -53,6 +56,9 @@ impl SsTableBuilder {
     /// Note: You should split a new block when the current block is full.(`std::mem::replace` may
     /// be helpful here)
     pub fn add(&mut self, key: KeySlice, value: &[u8]) {
+        // Compute hash for bloom filter
+        self.key_hashes.push(fingerprint32(key.raw_ref()));
+
         // If this is the first key, create a new meta
         if self.first_key.is_empty() {
             self.first_key = key.raw_ref().to_vec();
@@ -127,12 +133,17 @@ impl SsTableBuilder {
 
         // 记录元数据起始位置
         let meta_offset = buf.len();
-
         // 添加sstable元数据
         BlockMeta::encode_block_meta(&self.meta, &mut buf);
-
         // 添加元数据偏移量
         buf.extend_from_slice(&(meta_offset as u32).to_le_bytes());
+
+        // Build and write bloom filter
+        let bits_per_key = Bloom::bloom_bits_per_key(self.key_hashes.len() * 8, 0.1);
+        let bloom = Bloom::build_from_key_hashes(&self.key_hashes, bits_per_key);
+        let bloom_offset = buf.len();
+        bloom.encode(&mut buf);
+        buf.extend_from_slice(&(bloom_offset as u32).to_le_bytes());
 
         // 创建文件
         let file = FileObject::create(path.as_ref(), buf)?;
@@ -146,7 +157,7 @@ impl SsTableBuilder {
             block_cache,
             first_key: KeyBytes::from_bytes(Bytes::copy_from_slice(&self.first_key)),
             last_key: KeyBytes::from_bytes(Bytes::copy_from_slice(&self.last_key)),
-            bloom: None,
+            bloom: Some(bloom),
             max_ts: 0,
         })
     }

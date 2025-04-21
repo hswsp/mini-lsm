@@ -31,6 +31,8 @@ pub struct BlockBuilder {
     first_key: KeyVec,
 }
 
+/// We compare the current key with the first key in the block. We store the key as follows:
+/// key_overlap_len (u16) | rest_key_len (u16) | key (rest_key_len)
 impl BlockBuilder {
     /// Creates a new block builder.
     pub fn new(block_size: usize) -> Self {
@@ -45,8 +47,30 @@ impl BlockBuilder {
     /// Adds a key-value pair to the block. Returns false when the block is full.
     #[must_use]
     pub fn add(&mut self, key: KeySlice, value: &[u8]) -> bool {
+        // Calculate overlap with first key if this is not the first entry
+        let (key_overlap_len, rest_key) = if !self.is_empty() {
+            let first_key = self.first_key.raw_ref();
+            let current_key = key.raw_ref();
+            let mut overlap = 0;
+
+            // Calculate overlap length
+            for (a, b) in first_key.iter().zip(current_key.iter()) {
+                if a != b {
+                    break;
+                }
+                overlap += 1;
+            }
+            (overlap, &current_key[overlap..])
+        } else {
+            (0, key.raw_ref())
+        };
+
         // Calculate the size needed for this entry
-        let entry_size = 2 + key.raw_ref().len() + 2 + value.len(); // key_len + key + value_len + value
+        let entry_size = 2 + // key_overlap_len
+            2 + // rest_key_len
+            rest_key.len() + // rest of key
+            2 + // value_len
+            value.len(); // value data
 
         // Calculate the total size of current block
         let total_size = self.data.len() + self.offsets.len() * 2;
@@ -64,10 +88,14 @@ impl BlockBuilder {
         // Store the offset of this entry
         self.offsets.push(self.data.len() as u16);
 
-        // Write key length and key
+        // Write key_overlap_len
         self.data
-            .extend_from_slice(&(key.raw_ref().len() as u16).to_le_bytes());
-        self.data.extend_from_slice(key.raw_ref());
+            .extend_from_slice(&(key_overlap_len as u16).to_le_bytes());
+        // Write rest_key_len
+        self.data
+            .extend_from_slice(&(rest_key.len() as u16).to_le_bytes());
+        // Write rest of key
+        self.data.extend_from_slice(rest_key);
 
         // Write value length and value
         self.data
