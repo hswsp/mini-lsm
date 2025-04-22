@@ -22,6 +22,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use crc32fast::Hasher;
 use crossbeam_skiplist::SkipMap;
 use parking_lot::Mutex;
 
@@ -30,7 +31,7 @@ pub struct Wal {
 }
 
 /// The WAL encoding is simply a list of key-value pairs.
-/// | key_len | key | value_len | value |
+/// | key_len | key | value_len | value | checksum (u32) |
 impl Wal {
     pub fn create(_path: impl AsRef<Path>) -> Result<Self> {
         // File::create 的设计意图是创建一个新的文件，或者替换一个已存在的文件。 为了确保创建一个干净的状态，它会先清空文件内容
@@ -60,39 +61,49 @@ impl Wal {
         let mut rbuf = buf.as_slice();
 
         // Read all records from the buffer
-        while rbuf.has_remaining() {
-            // Make sure we have enough bytes for the key length
-            if rbuf.remaining() < 4 {
-                break;
-            }
+        while rbuf.remaining() >= 3 * std::mem::size_of::<u32>() {
+            // Minimum size: key_len(4) + value_len(4) + checksum(4)
+            let record_start = buf.len() - rbuf.remaining();
 
             // Read key length and validate
             let key_len = rbuf.get_u32_le() as usize;
-            if rbuf.remaining() < key_len {
-                break;
+            if rbuf.remaining() < key_len + 8 {
+                // +8 for value_len and checksum
+                panic!("WAL recover read key failed");
             }
 
             // Read key
-            let key = &rbuf[..key_len];
-            rbuf.advance(key_len);
-
-            // Make sure we have enough bytes for the value length
-            if rbuf.remaining() < 4 {
-                break;
-            }
+            let key = rbuf.copy_to_bytes(key_len);
 
             // Read value length and validate
+            // Make sure we have enough bytes for the value length
             let value_len = rbuf.get_u32_le() as usize;
-            if rbuf.remaining() < value_len {
-                break;
+            if rbuf.remaining() < value_len + 4 {
+                // +4 for checksum
+                panic!("WAL recover read value failed");
             }
 
             // Read value
-            let value = &rbuf[..value_len];
-            rbuf.advance(value_len);
+            let value = rbuf.copy_to_bytes(value_len);
+
+            // Calculate length of data for checksum (key_len + key + value_len + value)
+            let data_len =
+                std::mem::size_of::<u32>() + key_len + std::mem::size_of::<u32>() + value_len;
+
+            // Read and verify checksum
+            let stored_checksum = rbuf.get_u32_le();
+
+            // Calculate checksum of the record
+            let mut hasher = Hasher::new();
+            hasher.update(&buf[record_start..record_start + data_len]);
+            let computed_checksum = hasher.finalize();
+
+            if computed_checksum != stored_checksum {
+                panic!("WAL record checksum mismatch"); // Stop at corrupted record
+            }
 
             // Insert into skiplist
-            _skiplist.insert(Bytes::copy_from_slice(key), Bytes::copy_from_slice(value));
+            _skiplist.insert(key, value);
         }
 
         // Create WAL instance with the opened file
@@ -114,15 +125,18 @@ impl Wal {
             .iter()
             .map(|(key, value)| {
                 std::mem::size_of::<u32>() + // key length
-            key.len() +                   // key bytes
-            std::mem::size_of::<u32>() + // value length
-            value.len() // value bytes
+                key.len() +                   // key bytes
+                std::mem::size_of::<u32>() + // value length
+                value.len() + // value bytes
+                std::mem::size_of::<u32>() // checksum
             })
             .sum();
 
         let mut buf = BytesMut::with_capacity(total_capacity);
 
         for (key, value) in _data {
+            let start_pos = buf.len();
+
             // Write key length and key
             buf.put_u32_le(key.len() as u32);
             buf.put_slice(key);
@@ -130,6 +144,12 @@ impl Wal {
             // Write value length and value
             buf.put_u32_le(value.len() as u32);
             buf.put_slice(value);
+
+            // Calculate and write checksum
+            let mut hasher = Hasher::new();
+            hasher.update(&buf[start_pos..buf.len()]);
+            let checksum = hasher.finalize();
+            buf.put_u32_le(checksum);
         }
         // Write the entire buffer to file
         writer.write_all(&buf)?;

@@ -16,6 +16,7 @@
 
 use anyhow::Result;
 use bytes::{BufMut, Bytes, BytesMut};
+use crc32fast::Hasher;
 
 /// Implements a bloom filter
 pub struct Bloom {
@@ -65,22 +66,50 @@ impl<T: AsMut<[u8]>> BitSliceMut for T {
 impl Bloom {
     /// Decode a bloom filter
     pub fn decode(buf: &[u8]) -> Result<Self> {
+        let checksum_pos = buf.len() - 4;
+
         // 从输入字节切片中分离出过滤器数据和k值
         // filter 是除最后一个字节外的所有数据
-        let filter = &buf[..buf.len() - 1];
+        let k_pos = checksum_pos - 1;
+        let filter_data = &buf[..k_pos];
         // k值存储在最后一个字节
-        let k = buf[buf.len() - 1];
+        let k = buf[k_pos];
+
+        // Verify checksum
+        let stored_checksum = u32::from_le_bytes(buf[checksum_pos..].try_into().unwrap());
+
+        // Calculate checksum of filter data and k
+        let mut hasher = Hasher::new();
+        hasher.update(filter_data);
+        hasher.update(&[k]);
+        let computed_checksum = hasher.finalize();
+
+        if computed_checksum != stored_checksum {
+            return Err(anyhow::anyhow!("Bloom filter checksum mismatch"));
+        }
+
         Ok(Self {
-            filter: filter.to_vec().into(),
+            filter: filter_data.to_vec().into(),
             k,
         })
     }
 
     /// Encode a bloom filter
     pub fn encode(&self, buf: &mut Vec<u8>) {
+        // Record start position for checksum calculation
+        let start_pos = buf.len();
+
         buf.extend(&self.filter);
         // 将哈希函数数量 k 作为单个字节追加到缓冲区末尾
         buf.put_u8(self.k);
+
+        // Calculate checksum for the bloom filter content
+        let mut hasher = Hasher::new();
+        hasher.update(&buf[start_pos..]); // Hash both filter and k
+        let checksum = hasher.finalize();
+
+        // Append checksum
+        buf.extend_from_slice(&checksum.to_le_bytes());
     }
 
     /// Get bloom filter bits per key from entries count and FPR

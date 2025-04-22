@@ -22,6 +22,8 @@ use std::sync::Arc;
 use std::{fs::File, io::Write};
 
 use anyhow::{Context, Result};
+use bytes::Buf;
+use crc32fast::Hasher;
 use parking_lot::{Mutex, MutexGuard};
 use serde::{Deserialize, Serialize};
 
@@ -43,6 +45,8 @@ pub enum ManifestRecord {
 /// we designed the manifest to be a append-only file.
 /// The manifest format is like:
 /// | JSON record | JSON record | JSON record | JSON record |
+/// After adding checksum:
+/// | len | JSON record | checksum | len | JSON record | checksum | len | JSON record | checksum |
 impl Manifest {
     // Add this constant
     const DEFAULT_COMPACTION_THRESHOLD: usize = 1024 * 1024; // 1MB
@@ -76,9 +80,42 @@ impl Manifest {
 
         // Parse records using streaming deserializer
         let mut records = Vec::new();
-        let mut deserializer = serde_json::Deserializer::from_slice(&content);
-        while let Ok(record) = ManifestRecord::deserialize(&mut deserializer) {
-            records.push(record);
+        // let mut deserializer = serde_json::Deserializer::from_slice(&content);
+        // while let Ok(record) = ManifestRecord::deserialize(&mut deserializer) {
+        //     records.push(record);
+        // }
+        let mut rbuf = content.as_slice();
+        while rbuf.remaining() >= 2 * std::mem::size_of::<u32>() {
+            // Minimum: length(4) + checksum(4)
+            let record_start = content.len() - rbuf.remaining();
+
+            // Read record length
+            let record_len = rbuf.get_u32_le() as usize;
+            if rbuf.remaining() < record_len + 4 {
+                // +4 for checksum
+                panic!("Incomplete manifest record"); // Incomplete record
+            }
+
+            // Read JSON content
+            let json_data = rbuf.copy_to_bytes(record_len);
+
+            // Read checksum
+            let stored_checksum = rbuf.get_u32_le();
+
+            // Verify checksum
+            let mut hasher = Hasher::new();
+            hasher.update(&(record_len as u32).to_le_bytes());
+            hasher.update(&json_data);
+            let computed_checksum = hasher.finalize();
+
+            if computed_checksum != stored_checksum {
+                panic!("manifest record checksum mismatch"); // Corrupted record
+            }
+
+            // Parse record
+            if let Ok(record) = serde_json::from_slice(&json_data) {
+                records.push(record);
+            }
         }
 
         Ok((
@@ -106,7 +143,21 @@ impl Manifest {
 
         // Serialize and write record
         let json = serde_json::to_vec(&_record)?;
+
+        // Calculate total length needed (length + json + checksum)
+        let record_len = json.len();
+
+        // Write record length (4 bytes)
+        file.write_all(&(record_len as u32).to_le_bytes())?;
+        // Write JSON content
         file.write_all(&json)?;
+
+        // Calculate and write checksum
+        let mut hasher = Hasher::new();
+        hasher.update(&(record_len as u32).to_le_bytes());
+        hasher.update(&json);
+        let checksum = hasher.finalize();
+        file.write_all(&checksum.to_le_bytes())?;
 
         // Ensure record is written to disk
         file.sync_all()?;

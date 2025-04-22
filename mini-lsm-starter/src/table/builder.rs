@@ -25,7 +25,7 @@ use anyhow::Result;
 
 use super::{BlockMeta, FileObject, KeyBytes, SsTable, bloom::Bloom};
 use crate::{block::BlockBuilder, key::KeySlice, lsm_storage::BlockCache};
-
+use crc32fast::Hasher;
 /// Builds an SSTable from key-value pairs.
 pub struct SsTableBuilder {
     builder: BlockBuilder,
@@ -104,7 +104,17 @@ impl SsTableBuilder {
             current_meta.last_key = KeyBytes::from_bytes(Bytes::copy_from_slice(&self.last_key));
         }
 
-        self.data.extend_from_slice(&block.encode());
+        // Get block data
+        let block_data = block.encode();
+
+        // Calculate checksum for the block
+        let mut hasher = Hasher::new();
+        hasher.update(&block_data);
+        let checksum = hasher.finalize();
+
+        // Write block data and its checksum
+        self.data.extend_from_slice(&block_data);
+        self.data.extend_from_slice(&checksum.to_le_bytes());
     }
 
     /// Get the estimated size of the SSTable.

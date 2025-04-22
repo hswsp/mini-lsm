@@ -26,6 +26,7 @@ use std::sync::Arc;
 use anyhow::Result;
 pub use builder::SsTableBuilder;
 use bytes::Buf;
+use crc32fast::Hasher;
 use farmhash::fingerprint32;
 pub use iterator::SsTableIterator;
 
@@ -54,6 +55,12 @@ impl BlockMeta {
         #[allow(clippy::ptr_arg)] // remove this allow after you finish
         buf: &mut Vec<u8>,
     ) {
+        let start_pos = buf.len();
+
+        // Write number of blocks first (4 bytes)
+        buf.extend_from_slice(&(block_meta.len() as u32).to_le_bytes());
+
+        // Write actual metadata
         for meta in block_meta {
             buf.extend_from_slice(&(meta.offset as u64).to_le_bytes());
             buf.extend_from_slice(&(meta.first_key.len() as u64).to_le_bytes());
@@ -61,12 +68,42 @@ impl BlockMeta {
             buf.extend_from_slice(&(meta.last_key.len() as u64).to_le_bytes());
             buf.extend_from_slice(meta.last_key.raw_ref());
         }
+
+        // Calculate and append checksum
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&buf[start_pos..]);
+        let checksum = hasher.finalize();
+        buf.extend_from_slice(&checksum.to_le_bytes());
     }
 
     /// Decode block meta from a buffer.
     pub fn decode_block_meta(buf: impl Buf) -> Vec<BlockMeta> {
-        let mut block_meta = Vec::new();
         let mut buf = buf;
+
+        // Read number of blocks
+        let num_blocks = buf.get_u32_le() as usize;
+
+        // Calculate total content length (excluding checksum)
+        let content_end = buf.remaining() - 4; // -4 for checksum
+        let metadata_content = buf.copy_to_bytes(content_end);
+
+        // Read stored checksum
+        let stored_checksum = buf.get_u32_le();
+
+        // Verify checksum (includes block count and metadata content)
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&(num_blocks as u32).to_le_bytes());
+        hasher.update(&metadata_content);
+        let computed_checksum = hasher.finalize();
+
+        if computed_checksum != stored_checksum {
+            panic!("Block metadata checksum mismatch");
+        }
+
+        // Now process the metadata content
+        let mut buf = metadata_content;
+        let mut block_meta = Vec::with_capacity(num_blocks);
+
         while buf.has_remaining() {
             let offset = buf.get_u64_le() as usize;
             let first_key_len = buf.get_u64_le() as usize;
@@ -79,6 +116,10 @@ impl BlockMeta {
                 last_key,
             });
         }
+
+        // Verify we got the expected number of blocks
+        assert_eq!(block_meta.len(), num_blocks, "Block count mismatch");
+
         block_meta
     }
 }
@@ -127,6 +168,13 @@ impl FileObject {
 /// |                               |  varlen  |         u32       |    varlen    |        u32          |
 /// -----------------------------------------------------------------------------------------------------
 ///                        block_meta_offset    meta_offset_pos      bloom_offset   bloom_offset_pos
+/// Part 2: add check sum in Meta Section.
+/// ----------------------------------------------------------------------------------------------------------------------------------------------------------------
+/// |                   Block Section                     |                                                Meta Section                                            |
+/// ----------------------------------------------------------------------------------------------------------------------------------------------------------------
+/// | data block | checksum | ... | data block | checksum | no. of block | metadata | checksum | meta block offset | bloom filter | checksum | bloom filter offset |
+/// |   varlen   |    u32   |     |   varlen   |    u32   |     u32      |  varlen  |    u32   |        u32        |    varlen    |    u32   |        u32          |
+/// ----------------------------------------------------------------------------------------------------------------------------------------------------------------
 pub struct SsTable {
     /// The actual storage unit of SsTable, the format is as above.
     pub(crate) file: FileObject,
@@ -215,6 +263,7 @@ impl SsTable {
     /// Read a block from the disk.
     pub fn read_block(&self, block_idx: usize) -> Result<Arc<Block>> {
         let block_meta = &self.block_meta[block_idx];
+        // Block size includes checksum
         let block_size = if block_idx + 1 < self.block_meta.len() {
             self.block_meta[block_idx + 1].offset - block_meta.offset
         } else {
@@ -222,10 +271,27 @@ impl SsTable {
             self.block_meta_offset - block_meta.offset
         };
 
-        let block_data = self
+        let data = self
             .file
             .read(block_meta.offset as u64, block_size as u64)?;
-        Ok(Arc::new(Block::decode(block_data.as_slice())))
+
+        // Split block data and checksum
+        let block_data = &data[..data.len() - 4];
+        let stored_checksum = u32::from_le_bytes(data[data.len() - 4..].try_into().unwrap());
+
+        // Verify checksum
+        let mut hasher = Hasher::new();
+        hasher.update(block_data);
+        let computed_checksum = hasher.finalize();
+
+        if computed_checksum != stored_checksum {
+            return Err(anyhow::anyhow!(
+                "Block checksum mismatch at block {}",
+                block_idx
+            ));
+        }
+        // Decode block after verification
+        Ok(Arc::new(Block::decode(block_data)))
     }
 
     /// Read a block from disk, with block cache. (Day 4)
