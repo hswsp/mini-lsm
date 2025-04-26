@@ -44,6 +44,9 @@ impl Block {
     /// -----------------------------------------------------------------------
     /// | key_len (2B) | key (keylen) | value_len (2B) | value (varlen) | ... |
     /// -----------------------------------------------------------------------
+    ///
+    /// After adding timestamp, Entry should be:
+    /// | key_overlap_len (u16) | remaining_key_len (u16) | key (remaining_key_len) | timestamp (u64) |
     pub fn encode(&self) -> Bytes {
         let mut buf = Vec::with_capacity(
             self.data.len() + // Data Section
@@ -67,6 +70,8 @@ impl Block {
     }
 
     /// Decode from the data layout, transform the input `data` to a single `Block`
+    /// Format of each entry:
+    /// | key_overlap_len (2B) | remaining_key_len (2B) | key (remaining_key_len) | timestamp (8B) | value_len (2B) | value |
     pub fn decode(data: &[u8]) -> Self {
         // Read number of elements (last 2 bytes)
         let num_elements = u16::from_le_bytes(data[data.len() - 2..].try_into().unwrap()) as usize;

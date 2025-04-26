@@ -31,7 +31,7 @@ use farmhash::fingerprint32;
 pub use iterator::SsTableIterator;
 
 use crate::block::Block;
-use crate::key::{KeyBytes, KeySlice};
+use crate::key::{KeyBytes, KeySlice, TS_DEFAULT};
 use crate::lsm_storage::BlockCache;
 
 use self::bloom::Bloom;
@@ -52,6 +52,7 @@ impl BlockMeta {
     /// in order to help keep track of `first_key` when decoding from the same buffer in the future.
     pub fn encode_block_meta(
         block_meta: &[BlockMeta],
+        max_ts: u64,
         #[allow(clippy::ptr_arg)] // remove this allow after you finish
         buf: &mut Vec<u8>,
     ) {
@@ -63,11 +64,19 @@ impl BlockMeta {
         // Write actual metadata
         for meta in block_meta {
             buf.extend_from_slice(&(meta.offset as u64).to_le_bytes());
-            buf.extend_from_slice(&(meta.first_key.len() as u64).to_le_bytes());
-            buf.extend_from_slice(meta.first_key.raw_ref());
-            buf.extend_from_slice(&(meta.last_key.len() as u64).to_le_bytes());
-            buf.extend_from_slice(meta.last_key.raw_ref());
+
+            // Write first key length and data
+            buf.extend_from_slice(&(meta.first_key.key_len() as u64).to_le_bytes());
+            buf.extend_from_slice(meta.first_key.key_ref());
+            buf.extend_from_slice(&meta.first_key.ts().to_le_bytes());
+
+            // Write last key length and data
+            buf.extend_from_slice(&(meta.last_key.key_len() as u64).to_le_bytes());
+            buf.extend_from_slice(meta.last_key.key_ref());
+            buf.extend_from_slice(&meta.last_key.ts().to_le_bytes());
         }
+        // Write max timestamp for the entire block
+        buf.extend_from_slice(&max_ts.to_le_bytes());
 
         // Calculate and append checksum
         let mut hasher = crc32fast::Hasher::new();
@@ -77,7 +86,7 @@ impl BlockMeta {
     }
 
     /// Decode block meta from a buffer.
-    pub fn decode_block_meta(buf: impl Buf) -> Vec<BlockMeta> {
+    pub fn decode_block_meta(buf: impl Buf) -> Result<(Vec<BlockMeta>, u64)> {
         let mut buf = buf;
 
         // Read number of blocks
@@ -85,7 +94,7 @@ impl BlockMeta {
 
         // Calculate total content length (excluding checksum)
         let content_end = buf.remaining() - 4; // -4 for checksum
-        let metadata_content = buf.copy_to_bytes(content_end);
+        let mut metadata_content = buf.copy_to_bytes(content_end);
 
         // Read stored checksum
         let stored_checksum = buf.get_u32_le();
@@ -101,26 +110,36 @@ impl BlockMeta {
         }
 
         // Now process the metadata content
-        let mut buf = metadata_content;
         let mut block_meta = Vec::with_capacity(num_blocks);
 
-        while buf.has_remaining() {
-            let offset = buf.get_u64_le() as usize;
-            let first_key_len = buf.get_u64_le() as usize;
-            let first_key = KeyBytes::from_bytes(buf.copy_to_bytes(first_key_len));
-            let last_key_len = buf.get_u64_le() as usize;
-            let last_key = KeyBytes::from_bytes(buf.copy_to_bytes(last_key_len));
+        while metadata_content.remaining() > std::mem::size_of::<u64>() {
+            // Leave space for max_ts
+            let offset = metadata_content.get_u64_le() as usize;
+            // Read first key with timestamp
+            let first_key_len = metadata_content.get_u64_le() as usize;
+            let first_key_data = metadata_content.copy_to_bytes(first_key_len);
+            let first_key_ts = metadata_content.get_u64_le();
+            let first_key = KeyBytes::from_bytes_with_ts(first_key_data, first_key_ts);
+
+            // Read last key with timestamp
+            let last_key_len = metadata_content.get_u64_le() as usize;
+            let last_key_data = metadata_content.copy_to_bytes(last_key_len);
+            let last_key_ts = metadata_content.get_u64_le();
+            let last_key = KeyBytes::from_bytes_with_ts(last_key_data, last_key_ts);
+
             block_meta.push(BlockMeta {
                 offset,
                 first_key,
                 last_key,
             });
         }
+        // Read max timestamp
+        let max_ts = metadata_content.get_u64_le();
 
         // Verify we got the expected number of blocks
         assert_eq!(block_meta.len(), num_blocks, "Block count mismatch");
 
-        block_meta
+        Ok((block_meta, max_ts))
     }
 }
 
@@ -216,7 +235,8 @@ impl SsTable {
             block_meta_offset as u64,
             (meta_offset_pos - block_meta_offset) as u64,
         )?;
-        let block_meta = BlockMeta::decode_block_meta(block_meta_data.as_slice());
+        // Calculate max timestamp from block metadata
+        let (block_meta, max_ts) = BlockMeta::decode_block_meta(block_meta_data.as_slice())?;
 
         // Read bloom filter
         let bloom_data = file.read(
@@ -227,6 +247,7 @@ impl SsTable {
 
         let first_key = block_meta.first().unwrap().first_key.clone();
         let last_key = block_meta.last().unwrap().last_key.clone();
+
         Ok(Self {
             file,
             block_meta,
@@ -236,7 +257,7 @@ impl SsTable {
             first_key,
             last_key,
             bloom,
-            max_ts: 0,
+            max_ts,
         })
     }
 
@@ -256,7 +277,7 @@ impl SsTable {
             first_key,
             last_key,
             bloom: None,
-            max_ts: 0,
+            max_ts: TS_DEFAULT,
         }
     }
 

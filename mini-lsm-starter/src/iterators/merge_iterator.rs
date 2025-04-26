@@ -120,11 +120,11 @@ impl<I: 'static + for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>> StorageIt
         // Process all entries with the same key using peek_mut
         while let Some(mut inner_iter) = self.iters.peek_mut() {
             debug_assert!(
-                inner_iter.1.key() >= KeySlice::from_slice(current_key.raw_ref()),
+                inner_iter.1.key() >= current_key.as_key_slice(),
                 "heap invariant violated"
             );
 
-            if inner_iter.1.key() == KeySlice::from_slice(current_key.raw_ref()) {
+            if inner_iter.1.key() == current_key.as_key_slice() {
                 // Case 1: an error occurred when calling `next`.
                 if let e @ Err(_) = inner_iter.1.next() {
                     // we still need to pop the iterator from heap

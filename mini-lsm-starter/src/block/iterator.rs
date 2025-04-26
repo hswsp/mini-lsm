@@ -131,38 +131,65 @@ impl BlockIterator {
     /// Helper function to get the first key at offset without prefix compression
     fn get_first_key_at_offset(&self, offset: usize) -> KeyVec {
         // For first key, ignore key_overlap_len as it should be 0
-        let rest_key_len =
-            u16::from_le_bytes(self.block.data[offset + 2..offset + 4].try_into().unwrap())
-                as usize;
+        let remaining_key_len_offset = offset + std::mem::size_of::<u16>();
+        let remaining_key_offset = remaining_key_len_offset + std::mem::size_of::<u16>();
 
+        let rest_key_len = u16::from_le_bytes(
+            self.block.data[remaining_key_len_offset..remaining_key_offset]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let timestamp_offset = remaining_key_offset + rest_key_len;
         // Read the complete key
-        let key_data = &self.block.data[offset + 4..offset + 4 + rest_key_len];
-        KeyVec::from_vec(key_data.to_vec())
+        let key_data = &self.block.data[remaining_key_offset..timestamp_offset];
+        // Read timestamp after key data
+        let ts = u64::from_le_bytes(
+            self.block.data[timestamp_offset..timestamp_offset + std::mem::size_of::<u64>()]
+                .try_into()
+                .unwrap(),
+        );
+
+        KeyVec::from_vec_with_ts(key_data.to_vec(), ts)
     }
 
     /// Helper function to get the key at a given offset
     fn get_key_at_offset(&self, offset: usize) -> KeyVec {
+        let remaining_key_len_offset = offset + std::mem::size_of::<u16>();
+        let remaining_key_offset = remaining_key_len_offset + std::mem::size_of::<u16>();
         // Read key_overlap_len
-        let key_overlap_len =
-            u16::from_le_bytes(self.block.data[offset..offset + 2].try_into().unwrap()) as usize;
+        let key_overlap_len = u16::from_le_bytes(
+            self.block.data[offset..remaining_key_len_offset]
+                .try_into()
+                .unwrap(),
+        ) as usize;
 
         // Read rest_key_len
-        let rest_key_len =
-            u16::from_le_bytes(self.block.data[offset + 2..offset + 4].try_into().unwrap())
-                as usize;
+        let rest_key_len = u16::from_le_bytes(
+            self.block.data[remaining_key_len_offset..remaining_key_offset]
+                .try_into()
+                .unwrap(),
+        ) as usize;
 
+        let timestamp_offset = remaining_key_offset + rest_key_len;
         // Construct full key using overlap
         let mut full_key = Vec::with_capacity(key_overlap_len + rest_key_len);
 
         // Add overlapping part from first key
         if key_overlap_len > 0 {
-            full_key.extend_from_slice(&self.first_key.raw_ref()[..key_overlap_len]);
+            full_key.extend_from_slice(&self.first_key.key_ref()[..key_overlap_len]);
         }
 
         // Add rest of the key
-        full_key.extend_from_slice(&self.block.data[offset + 4..offset + 4 + rest_key_len]);
+        full_key.extend_from_slice(&self.block.data[remaining_key_offset..timestamp_offset]);
 
-        KeyVec::from_vec(full_key)
+        // Read timestamp after key data
+        let ts = u64::from_le_bytes(
+            self.block.data[timestamp_offset..timestamp_offset + std::mem::size_of::<u64>()]
+                .try_into()
+                .unwrap(),
+        );
+
+        KeyVec::from_vec_with_ts(full_key, ts)
     }
 
     /// Helper function to get the value range at a given index.
@@ -177,7 +204,7 @@ impl BlockIterator {
                 as usize;
 
         // Calculate value position
-        let value_offset = offset + 4 + rest_key_len;
+        let value_offset = offset + 4 + rest_key_len + std::mem::size_of::<u64>();
         let value_len = u16::from_le_bytes(
             self.block.data[value_offset..value_offset + 2]
                 .try_into()

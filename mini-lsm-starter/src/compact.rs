@@ -321,7 +321,7 @@ impl LsmStorageInner {
             if !merge_iter.value().is_empty() {
                 // Add key-value pair to current builder
                 current_builder.add(merge_iter.key(), merge_iter.value());
-                current_size += merge_iter.key().len() + merge_iter.value().len();
+                current_size += merge_iter.key().raw_len() + merge_iter.value().len();
             }
 
             // If builder exceeds target size, flush it

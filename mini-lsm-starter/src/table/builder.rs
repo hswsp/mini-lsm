@@ -15,7 +15,6 @@
 #![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
-use bytes::Bytes;
 use farmhash::fingerprint32;
 use std::mem;
 use std::path::Path;
@@ -23,18 +22,23 @@ use std::sync::Arc; // Add this import
 
 use anyhow::Result;
 
-use super::{BlockMeta, FileObject, KeyBytes, SsTable, bloom::Bloom};
-use crate::{block::BlockBuilder, key::KeySlice, lsm_storage::BlockCache};
+use super::{BlockMeta, FileObject, SsTable, bloom::Bloom};
+use crate::{
+    block::BlockBuilder,
+    key::{KeySlice, KeyVec},
+    lsm_storage::BlockCache,
+};
 use crc32fast::Hasher;
 /// Builds an SSTable from key-value pairs.
 pub struct SsTableBuilder {
     builder: BlockBuilder,
-    first_key: Vec<u8>,
-    last_key: Vec<u8>,
+    first_key: KeyVec,
+    last_key: KeyVec,
     data: Vec<u8>,
     pub(crate) meta: Vec<BlockMeta>,
     block_size: usize,
     key_hashes: Vec<u32>,
+    max_ts: u64,
 }
 
 impl SsTableBuilder {
@@ -42,12 +46,13 @@ impl SsTableBuilder {
     pub fn new(block_size: usize) -> Self {
         SsTableBuilder {
             builder: BlockBuilder::new(block_size),
-            first_key: Vec::new(),
-            last_key: Vec::new(),
+            first_key: KeyVec::new(),
+            last_key: KeyVec::new(),
             data: Vec::new(),
             meta: Vec::new(),
             block_size,
             key_hashes: Vec::new(),
+            max_ts: 0, // Initialize max_ts
         }
     }
 
@@ -56,16 +61,18 @@ impl SsTableBuilder {
     /// Note: You should split a new block when the current block is full.(`std::mem::replace` may
     /// be helpful here)
     pub fn add(&mut self, key: KeySlice, value: &[u8]) {
+        // Update max timestamp
+        self.max_ts = std::cmp::max(self.max_ts, key.ts());
         // Compute hash for bloom filter
-        self.key_hashes.push(fingerprint32(key.raw_ref()));
+        self.key_hashes.push(fingerprint32(key.key_ref()));
 
         // If this is the first key, create a new meta
         if self.first_key.is_empty() {
-            self.first_key = key.raw_ref().to_vec();
+            self.first_key = key.to_key_vec();
             self.meta.push(BlockMeta {
                 offset: 0,
-                first_key: KeyBytes::from_bytes(Bytes::copy_from_slice(key.raw_ref())),
-                last_key: KeyBytes::from_bytes(Bytes::copy_from_slice(key.raw_ref())),
+                first_key: key.to_key_vec().into_key_bytes(),
+                last_key: key.to_key_vec().into_key_bytes(),
             });
         }
 
@@ -75,14 +82,14 @@ impl SsTableBuilder {
             // Create a new meta for the new block
             self.meta.push(BlockMeta {
                 offset: self.data.len(),
-                first_key: KeyBytes::from_bytes(Bytes::copy_from_slice(key.raw_ref())),
-                last_key: KeyBytes::from_bytes(Bytes::copy_from_slice(key.raw_ref())),
+                first_key: key.to_key_vec().into_key_bytes(),
+                last_key: key.to_key_vec().into_key_bytes(),
             });
             assert!(self.builder.add(key, value));
         }
 
         // Update last key
-        self.last_key = key.raw_ref().to_vec();
+        self.last_key = key.to_key_vec();
 
         // Print first and last keys as both hex and UTF-8 strings
         // println!(
@@ -100,8 +107,8 @@ impl SsTableBuilder {
         let block = old_builder.build();
 
         // Update the last key of current meta before sealing
-        if let Some(current_meta) = self.meta.last_mut() {
-            current_meta.last_key = KeyBytes::from_bytes(Bytes::copy_from_slice(&self.last_key));
+        if let Some(last_meta) = self.meta.last_mut() {
+            last_meta.last_key = self.last_key.clone().into_key_bytes();
         }
 
         // Get block data
@@ -137,14 +144,32 @@ impl SsTableBuilder {
         if !self.builder.is_empty() {
             self.seal_block();
         }
-
+        
+        {
+            // Debug print SSTable metadata
+            println!("\n=== SSTable Build Info ===");
+            println!("SSTable ID: {}", id);
+            println!("Max Timestamp: {}", self.max_ts);
+            println!("First Key: '{}' (ts: {})", 
+                String::from_utf8_lossy(self.first_key.key_ref()),
+                self.first_key.ts()
+            );
+            println!("Last Key: '{}' (ts: {})", 
+                String::from_utf8_lossy(self.last_key.key_ref()),
+                self.last_key.ts()
+            );
+            println!("Number of Blocks: {}", self.meta.len());
+            println!("Total Data Size: {} bytes", self.data.len());
+            println!("========================\n");
+        }
+        
         // 准备数据
         let mut buf = self.data;
 
         // 记录元数据起始位置
         let meta_offset = buf.len();
-        // 添加sstable元数据
-        BlockMeta::encode_block_meta(&self.meta, &mut buf);
+        // Encode block meta with max_ts
+        BlockMeta::encode_block_meta(&self.meta, self.max_ts, &mut buf);
         // 添加元数据偏移量
         buf.extend_from_slice(&(meta_offset as u32).to_le_bytes());
 
@@ -160,15 +185,15 @@ impl SsTableBuilder {
 
         // 构建SSTable
         Ok(SsTable {
+            id,
             file,
+            first_key: self.first_key.into_key_bytes(),
+            last_key: self.last_key.into_key_bytes(),
             block_meta: self.meta,
             block_meta_offset: meta_offset,
-            id,
             block_cache,
-            first_key: KeyBytes::from_bytes(Bytes::copy_from_slice(&self.first_key)),
-            last_key: KeyBytes::from_bytes(Bytes::copy_from_slice(&self.last_key)),
             bloom: Some(bloom),
-            max_ts: 0,
+            max_ts: self.max_ts,
         })
     }
 
