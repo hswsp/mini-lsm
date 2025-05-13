@@ -36,6 +36,7 @@ impl LsmStorageInner {
     }
 
     /// Print debug information about memtables and their WALs
+    #[allow(dead_code)]
     pub fn dump_memtables(&self) {
         let state = self.state.read();
         println!("------------- print memtables: -----------");

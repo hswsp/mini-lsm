@@ -124,6 +124,23 @@ impl<I: 'static + for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>> StorageIt
                 "heap invariant violated"
             );
 
+            if 1 == 0 {
+                // Add debug output
+                let debug_enabled = std::env::var("RUST_BACKTRACE")
+                    .map(|val| val == "1")
+                    .unwrap_or(false);
+
+                if debug_enabled {
+                    println!(
+                        "[MergeIterator] Comparing keys: inner_iter.key='{}' (ts={}), current_key='{}' (ts={})",
+                        String::from_utf8_lossy(inner_iter.1.key().key_ref()),
+                        inner_iter.1.key().ts(),
+                        String::from_utf8_lossy(current_key.as_key_slice().key_ref()),
+                        current_key.as_key_slice().ts(),
+                    );
+                }
+            }
+            // Skip the same old keys
             if inner_iter.1.key() == current_key.as_key_slice() {
                 // Case 1: an error occurred when calling `next`.
                 if let e @ Err(_) = inner_iter.1.next() {

@@ -25,7 +25,7 @@ use anyhow::Result;
 use super::{BlockMeta, FileObject, SsTable, bloom::Bloom};
 use crate::{
     block::BlockBuilder,
-    key::{KeySlice, KeyVec},
+    key::{KeyBytes, KeySlice, KeyVec},
     lsm_storage::BlockCache,
 };
 use crc32fast::Hasher;
@@ -144,17 +144,23 @@ impl SsTableBuilder {
         if !self.builder.is_empty() {
             self.seal_block();
         }
-        
-        {
+
+        // Check if debug output should be enabled
+        let debug_enabled = std::env::var("RUST_BACKTRACE")
+            .map(|val| val == "1")
+            .unwrap_or(false);
+        if debug_enabled {
             // Debug print SSTable metadata
             println!("\n=== SSTable Build Info ===");
             println!("SSTable ID: {}", id);
             println!("Max Timestamp: {}", self.max_ts);
-            println!("First Key: '{}' (ts: {})", 
+            println!(
+                "First Key: '{}' (ts: {})",
                 String::from_utf8_lossy(self.first_key.key_ref()),
                 self.first_key.ts()
             );
-            println!("Last Key: '{}' (ts: {})", 
+            println!(
+                "Last Key: '{}' (ts: {})",
                 String::from_utf8_lossy(self.last_key.key_ref()),
                 self.last_key.ts()
             );
@@ -162,7 +168,24 @@ impl SsTableBuilder {
             println!("Total Data Size: {} bytes", self.data.len());
             println!("========================\n");
         }
-        
+
+        // 先检查数据是否为空
+        if self.data.is_empty() {
+            // 创建空文件
+            let file = FileObject::create(path.as_ref(), vec![])?;
+
+            return Ok(SsTable {
+                id,
+                file,
+                first_key: KeyBytes::new(),
+                last_key: KeyBytes::new(),
+                block_meta: vec![],
+                block_meta_offset: 0,
+                block_cache,
+                bloom: None,
+                max_ts: self.max_ts,
+            });
+        }
         // 准备数据
         let mut buf = self.data;
 

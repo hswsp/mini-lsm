@@ -315,24 +315,35 @@ impl LsmStorageInner {
         let mut new_ssts = Vec::new();
         let mut current_builder = SsTableBuilder::new(self.options.block_size);
         let mut current_size = 0;
+        let mut last_user_key: Option<Vec<u8>> = None;
 
+        // for now, and you should keep ALL versions of a key during the compaction.
         while merge_iter.is_valid() {
-            // Only add the key-value pair if it's not a delete marker
-            if !merge_iter.value().is_empty() {
-                // Add key-value pair to current builder
-                current_builder.add(merge_iter.key(), merge_iter.value());
-                current_size += merge_iter.key().raw_len() + merge_iter.value().len();
+            let current_key = merge_iter.key();
+            let current_value = merge_iter.value();
+
+            match &last_user_key {
+                Some(last_key) if last_key == current_key.key_ref() => {
+                    // he same key with different timestamps are put in the same SST file,
+                    // even if it exceeds the SST size limit
+                    current_builder.add(current_key, current_value);
+                    current_size += current_key.raw_len() + current_value.len();
+                }
+                _ => {
+                    // Different user key
+                    if current_size >= self.options.target_sst_size {
+                        // Only seal SST when we see a different user key
+                        self.seal_sst(current_builder, &mut new_ssts)?;
+                        current_builder = SsTableBuilder::new(self.options.block_size);
+                        current_size = 0;
+                    }
+                    // Add the key-value pair
+                    current_builder.add(current_key, current_value);
+                    current_size += current_key.raw_len() + current_value.len();
+                    // Update last_user_key
+                    last_user_key = Some(current_key.key_ref().to_vec());
+                }
             }
-
-            // If builder exceeds target size, flush it
-            if current_size >= self.options.target_sst_size {
-                self.seal_sst(current_builder, &mut new_ssts)?;
-
-                // Start new builder
-                current_builder = SsTableBuilder::new(self.options.block_size);
-                current_size = 0;
-            }
-
             merge_iter.next()?;
         }
 
@@ -442,6 +453,7 @@ impl LsmStorageInner {
         println!("trigger compaction: {:?}", task);
         println!("-------------  print LSM structure before compaction -----------------");
         self.dump_structure();
+        println!("-------------  ------------------------------------- -----------------");
 
         // 2. Run compaction
         let new_ssts = self.compact(&task)?;

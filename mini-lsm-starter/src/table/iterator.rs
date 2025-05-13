@@ -20,7 +20,11 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use super::SsTable;
-use crate::{block::BlockIterator, iterators::StorageIterator, key::KeySlice};
+use crate::{
+    block::{Block, BlockIterator},
+    iterators::StorageIterator,
+    key::KeySlice,
+};
 
 /// An iterator over the contents of an SSTable.
 /// you should load data on demand.
@@ -55,6 +59,19 @@ fn find_block_idx_for_key(table: Arc<SsTable>, key: KeySlice) -> usize {
 impl SsTableIterator {
     /// Create a new iterator and seek to the first key-value pair in the first data block.
     pub fn create_and_seek_to_first(table: Arc<SsTable>) -> Result<Self> {
+        // Check if table is empty
+        if table.num_of_blocks() == 0 {
+            // Create an empty block
+            let empty_data = vec![0, 0]; // 2 bytes for num_elements = 0
+            let empty_block = Arc::new(Block::decode(&empty_data));
+            // Return an iterator with an invalid block iterator
+            return Ok(SsTableIterator {
+                table,
+                blk_iter: BlockIterator::create_and_seek_to_first(empty_block),
+                blk_idx: 0,
+            });
+        }
+
         let block = table.read_block_cached(0)?;
         let blk_iter = BlockIterator::create_and_seek_to_first(block);
 

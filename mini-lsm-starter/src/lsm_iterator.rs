@@ -45,21 +45,32 @@ type LsmIteratorInner = TwoMergeIterator<
     MergeIterator<SstConcatIterator>, // L1+ SSTs iterator using concat
 >;
 
+// 这里end_bound被check了， begin_bound没有被check，取决去初始的inner。
 pub struct LsmIterator {
     inner: LsmIteratorInner,
     end_bound: Bound<Bytes>,
+    is_valid: bool,
+    read_ts: u64,
+    prev_key: Vec<u8>,
 }
 
 impl LsmIterator {
-    pub(crate) fn new(iter: LsmIteratorInner, end_bound: impl Into<Bound<Bytes>>) -> Result<Self> {
+    pub(crate) fn new(
+        iter: LsmIteratorInner,
+        end_bound: impl Into<Bound<Bytes>>,
+        read_ts: u64,
+    ) -> Result<Self> {
         Ok(Self {
+            is_valid: iter.is_valid(),
             inner: iter,
             end_bound: end_bound.into(),
+            read_ts,
+            prev_key: Vec::new(),
         })
     }
 
     fn check_end_bound(&self) -> bool {
-        match &self.end_bound {
+        match &self.end_bound.as_ref() {
             Bound::Included(bound) => self.inner.key().key_ref() <= bound.as_ref(),
             Bound::Excluded(bound) => self.inner.key().key_ref() < bound.as_ref(),
             Bound::Unbounded => true,
@@ -83,14 +94,52 @@ impl StorageIterator for LsmIterator {
     }
 
     fn next(&mut self) -> Result<()> {
+        if !self.is_valid() {
+            return Ok(());
+        }
+
+        // 记录当前键，用于跳过旧版本
+        self.prev_key = self.key().to_vec();
+
         // 推进底层迭代器
         self.inner.next()?;
 
-        // 跳过删除标记（空值）
-        while self.is_valid() && self.inner.value().is_empty() {
-            self.inner.next()?;
-        }
+        // Add debug output
+        let debug_enabled = std::env::var("RUST_BACKTRACE")
+            .map(|val| val == "1")
+            .unwrap_or(false);
 
+        while self.is_valid() {
+            if debug_enabled {
+                println!(
+                    "[LsmIterator] prev_key='{}', current_key='{}' (ts={}), value='{}'",
+                    String::from_utf8_lossy(&self.prev_key),
+                    String::from_utf8_lossy(self.inner.key().key_ref()),
+                    self.inner.key().ts(),
+                    String::from_utf8_lossy(self.inner.value()),
+                );
+            }
+
+            // 检查是否是同一个键的旧版本
+            if self.key() == self.prev_key.as_slice() {
+                // 同一个键的旧版本，继续前进
+                self.inner.next()?;
+                continue;
+            }
+
+            // 检查是否是已删除的键
+            if self.inner.value().is_empty() {
+                // 更新 prev_key到下一个空key
+                self.prev_key = self.key().to_vec();
+
+                // 删除标记，继续前进
+                self.inner.next()?;
+                continue;
+            }
+
+            // 找到了新的有效键
+            break;
+        }
         Ok(())
     }
 
