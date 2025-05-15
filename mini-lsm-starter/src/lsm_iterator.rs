@@ -60,13 +60,24 @@ impl LsmIterator {
         end_bound: impl Into<Bound<Bytes>>,
         read_ts: u64,
     ) -> Result<Self> {
-        Ok(Self {
+        let mut iter = Self {
             is_valid: iter.is_valid(),
             inner: iter,
             end_bound: end_bound.into(),
             read_ts,
             prev_key: Vec::new(),
-        })
+        };
+        let debug_enabled = std::env::var("RUST_BACKTRACE")
+            .map(|val| val == "1")
+            .unwrap_or(false);
+        if debug_enabled {
+            println!("======== init LsmIterator ========");
+        }
+        iter.move_to_key()?;
+        if debug_enabled {
+            println!("======== init LsmIterator move_to_key done ========");
+        }
+        Ok(iter)
     }
 
     fn check_end_bound(&self) -> bool {
@@ -75,6 +86,74 @@ impl LsmIterator {
             Bound::Excluded(bound) => self.inner.key().key_ref() < bound.as_ref(),
             Bound::Unbounded => true,
         }
+    }
+
+    /// Moves the underlying iterator to the next position
+    fn next_inner(&mut self) -> Result<()> {
+        // Advance underlying iterator
+        self.inner.next()?;
+
+        if !self.is_valid() {
+            self.is_valid = false;
+        }
+        Ok(())
+    }
+
+    /// Moves to the next valid key, skipping:
+    /// 1. Keys with timestamp > read_ts
+    /// 2. Older versions of the same key
+    /// 3. Tombstone (deleted) keys
+    fn move_to_key(&mut self) -> Result<()> {
+        let debug_enabled = std::env::var("RUST_BACKTRACE")
+            .map(|val| val == "1")
+            .unwrap_or(false);
+        if debug_enabled {
+            println!("[LsmIterator] current read_ts: {}", self.read_ts);
+        }
+
+        while self.is_valid() {
+            // Skip older versions of the same key
+            if self.key() == self.prev_key.as_slice() {
+                self.inner.next()?;
+                continue;
+            }
+            // Record current key before moving
+            self.prev_key = self.key().to_vec();
+
+            if debug_enabled {
+                println!(
+                    "[LsmIterator] prev_key='{}', current_key='{}' (ts={}), value='{}'",
+                    String::from_utf8_lossy(&self.prev_key),
+                    String::from_utf8_lossy(self.inner.key().key_ref()),
+                    self.inner.key().ts(),
+                    String::from_utf8_lossy(self.inner.value()),
+                );
+            }
+
+            // Skip keys with timestamp greater than read_ts
+            while self.is_valid()
+                && self.inner.key().key_ref() == self.prev_key
+                && self.inner.key().ts() > self.read_ts
+            {
+                self.inner.next()?;
+            }
+
+            if !self.inner.is_valid() {
+                break;
+            }
+
+            // If all put ts > read_ts, will go this line to the next key
+            if self.inner.key().key_ref() != self.prev_key {
+                continue;
+            }
+
+            // Skip tombstones (deleted keys)
+            if !self.inner.value().is_empty() {
+                // Found a valid key
+                break;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -97,49 +176,8 @@ impl StorageIterator for LsmIterator {
         if !self.is_valid() {
             return Ok(());
         }
-
-        // 记录当前键，用于跳过旧版本
-        self.prev_key = self.key().to_vec();
-
-        // 推进底层迭代器
-        self.inner.next()?;
-
-        // Add debug output
-        let debug_enabled = std::env::var("RUST_BACKTRACE")
-            .map(|val| val == "1")
-            .unwrap_or(false);
-
-        while self.is_valid() {
-            if debug_enabled {
-                println!(
-                    "[LsmIterator] prev_key='{}', current_key='{}' (ts={}), value='{}'",
-                    String::from_utf8_lossy(&self.prev_key),
-                    String::from_utf8_lossy(self.inner.key().key_ref()),
-                    self.inner.key().ts(),
-                    String::from_utf8_lossy(self.inner.value()),
-                );
-            }
-
-            // 检查是否是同一个键的旧版本
-            if self.key() == self.prev_key.as_slice() {
-                // 同一个键的旧版本，继续前进
-                self.inner.next()?;
-                continue;
-            }
-
-            // 检查是否是已删除的键
-            if self.inner.value().is_empty() {
-                // 更新 prev_key到下一个空key
-                self.prev_key = self.key().to_vec();
-
-                // 删除标记，继续前进
-                self.inner.next()?;
-                continue;
-            }
-
-            // 找到了新的有效键
-            break;
-        }
+        self.next_inner()?;
+        self.move_to_key()?;
         Ok(())
     }
 

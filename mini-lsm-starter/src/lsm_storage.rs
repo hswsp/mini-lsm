@@ -19,10 +19,11 @@ use std::collections::{BTreeSet, HashMap};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
+use crossbeam_skiplist::SkipMap;
 use parking_lot::{Mutex, MutexGuard, RwLock};
 
 use crate::block::Block;
@@ -33,15 +34,17 @@ use crate::compact::{
 use crate::iterators::StorageIterator;
 use crate::iterators::concat_iterator::SstConcatIterator;
 use crate::iterators::two_merge_iterator::TwoMergeIterator;
-use crate::key::{KeySlice, TS_DEFAULT, TS_RANGE_BEGIN, TS_RANGE_END};
+use crate::key::{
+    KeySlice, TS_DEFAULT, TS_RANGE_BEGIN, TS_RANGE_END, map_bound, map_key_bound_plus_ts,
+};
 use crate::manifest::ManifestRecord;
-use crate::mem_table::{map_bound, map_key_bound_plus_ts};
+use crate::mvcc::txn::{Transaction, TxnIterator, TxnLocalIterator};
 use crate::table::{FileObject, SsTableBuilder, SsTableIterator};
 use crate::{
     iterators::merge_iterator::MergeIterator,
     lsm_iterator::{FusedIterator, LsmIterator},
     manifest::Manifest,
-    mem_table::{MemTable, MemTableIterator},
+    mem_table::MemTable,
     mvcc::LsmMvccInner,
     table::SsTable,
 };
@@ -248,7 +251,7 @@ impl MiniLsm {
         }))
     }
 
-    pub fn new_txn(&self) -> Result<()> {
+    pub fn new_txn(&self) -> Result<Arc<Transaction>> {
         self.inner.new_txn()
     }
 
@@ -276,11 +279,7 @@ impl MiniLsm {
         self.inner.sync()
     }
 
-    pub fn scan(
-        &self,
-        lower: Bound<&[u8]>,
-        upper: Bound<&[u8]>,
-    ) -> Result<FusedIterator<LsmIterator>> {
+    pub fn scan(self: &Arc<Self>, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> Result<TxnIterator> {
         self.inner.scan(lower, upper)
     }
 
@@ -564,15 +563,13 @@ impl LsmStorageInner {
         compaction_filters.push(compaction_filter);
     }
 
-    /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
-    /// delete implementation should simply put an empty slice for that key
-    pub fn get(&self, _key: &[u8]) -> Result<Option<Bytes>> {
+    pub fn get_with_ts(&self, _key: &[u8], read_ts: u64) -> Result<Option<Bytes>> {
         let snapshot = {
             let guard = self.state.read();
             Arc::clone(&guard)
         };
 
-        // Set up bounds for single key scan
+        // Set up bounds for single key scan with timestamps
         let lower = Bound::Included(KeySlice::from_slice(_key, TS_RANGE_BEGIN));
         let upper = Bound::Included(KeySlice::from_slice(_key, TS_RANGE_END));
 
@@ -584,14 +581,16 @@ impl LsmStorageInner {
         }
         let mem_merge_iter = MergeIterator::create(mem_iters.into_iter().map(Box::new).collect());
 
-        //Create L0 SST iterators (with bloom filter)
+        // Create L0 SST iterators (with bloom filter)
         let mut l0_iters = Vec::new();
         for &sst_id in snapshot.l0_sstables.iter() {
             if let Some(sst) = snapshot.sstables.get(&sst_id) {
-                // Skip if key not in range or fails bloom filter check
-                if !(_key >= sst.first_key().key_ref()
-                    && _key <= sst.last_key().key_ref()
-                    && sst.may_contain(_key))
+                if !range_overlap(
+                    Bound::Included(_key),
+                    Bound::Included(_key),
+                    sst.first_key().as_key_slice(),
+                    sst.last_key().as_key_slice(),
+                ) || !sst.may_contain(_key)
                 {
                     continue;
                 }
@@ -606,10 +605,12 @@ impl LsmStorageInner {
             let mut ssts = Vec::new();
             for &sst_id in level_ssts {
                 if let Some(sst) = snapshot.sstables.get(&sst_id) {
-                    // Skip if key not in range or fails bloom filter check
-                    if !(_key >= sst.first_key().key_ref()
-                        && _key <= sst.last_key().key_ref()
-                        && sst.may_contain(_key))
+                    if !range_overlap(
+                        Bound::Included(_key),
+                        Bound::Included(_key),
+                        sst.first_key().as_key_slice(),
+                        sst.last_key().as_key_slice(),
+                    ) || !sst.may_contain(_key)
                     {
                         continue;
                     }
@@ -628,26 +629,52 @@ impl LsmStorageInner {
 
         // Merge all iterators
         let l0_sst_merge_iter = TwoMergeIterator::create(mem_merge_iter, l0_merge_iter)?;
-        let two_merge_iter = TwoMergeIterator::create(l0_sst_merge_iter, level_merge_iter)?;
+        let mut two_merge_iter = TwoMergeIterator::create(l0_sst_merge_iter, level_merge_iter)?;
 
         // Find first valid key-value pair
         if !two_merge_iter.is_valid() {
             return Ok(None);
         }
 
-        // Check if we found the correct key
-        let key = two_merge_iter.key();
-        if key.key_ref() != _key {
-            return Ok(None);
+        // Keep checking versions of the same key until we find one with ts <= read_ts
+        while two_merge_iter.is_valid() {
+            // Check if we found the correct key
+            let current_key = two_merge_iter.key();
+            if current_key.key_ref() != _key {
+                return Ok(None);
+            }
+
+            // Check timestamp
+            if current_key.ts() <= read_ts {
+                // Found a version that's visible to this transaction
+                let value = two_merge_iter.value();
+                if value.is_empty() {
+                    // Key was deleted at this version
+                    return Ok(None);
+                }
+                return Ok(Some(Bytes::copy_from_slice(value)));
+            }
+
+            // Move to next version
+            two_merge_iter.next()?;
         }
 
-        // Check if it's a deletion marker
-        let value = two_merge_iter.value();
-        if value.is_empty() {
-            return Ok(None);
-        }
+        // No valid version found
+        Ok(None)
+    }
 
-        Ok(Some(Bytes::copy_from_slice(value)))
+    /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
+    /// delete implementation should simply put an empty slice for that key
+    pub fn get(&self, _key: &[u8]) -> Result<Option<Bytes>> {
+        // Create a new transaction
+        let read_ts = if let Some(mvcc) = &self.mvcc {
+            mvcc.latest_commit_ts()
+        } else {
+            u64::MAX
+        };
+
+        // Use get_with_ts with transaction's read timestamp
+        self.get_with_ts(_key, read_ts)
     }
 
     fn try_freeze(&self, estimated_size: usize) -> Result<()> {
@@ -894,16 +921,19 @@ impl LsmStorageInner {
         Ok(())
     }
 
-    pub fn new_txn(&self) -> Result<()> {
-        // no-op
-        Ok(())
+    pub(crate) fn mvcc(&self) -> &LsmMvccInner {
+        self.mvcc.as_ref().unwrap()
     }
 
-    /// Create an iterator over a range of keys.
-    pub fn scan(
+    pub fn new_txn(self: &Arc<Self>) -> Result<Arc<Transaction>> {
+        Ok(self.mvcc().new_txn(self.clone(), self.options.serializable))
+    }
+
+    pub fn scan_with_ts(
         &self,
         _lower: Bound<&[u8]>,
         _upper: Bound<&[u8]>,
+        read_ts: u64,
     ) -> Result<FusedIterator<LsmIterator>> {
         // Take a snapshot of the state to release the lock early
         let snapshot = {
@@ -911,101 +941,141 @@ impl LsmStorageInner {
             Arc::clone(&guard)
         };
 
-        // 添加当前 memtable
         // Convert bounds to include timestamps.
         // KeySlice的partialOder是TS越大，值越小。TS_RANGE_BEGIN: u64 = u64::MAX. 如果存入的是TS_DEFAULT, 就会被Excluded包括进去。
         let lower = map_key_bound_plus_ts(_lower, TS_RANGE_BEGIN);
         let upper = map_key_bound_plus_ts(_upper, TS_RANGE_END);
 
-        // 收集所有 memtable 迭代器
-        let mut mem_iters = Vec::new();
-        mem_iters.push(snapshot.memtable.scan(lower, upper));
-        // 添加 immutable memtables
-        // 最新的在最前面
-        for imm_mem in &snapshot.imm_memtables {
-            mem_iters.push(imm_mem.scan(lower, upper));
-        }
-
-        // 转换为 Box<MemTableIterator> 的集合
-        let boxed_iters: Vec<Box<MemTableIterator>> = mem_iters.into_iter().map(Box::new).collect();
-        // 创建MemTableIterator
-        let mem_merge_iter = MergeIterator::create(boxed_iters);
-        // Debug print mem_table keys
-        // Check if debug output should be enabled
-        let debug_enabled = std::env::var("RUST_BACKTRACE")
-            .map(|val| val == "1")
-            .unwrap_or(false);
-
-        if debug_enabled {
-            // Create separate iterators for debug printing
-            println!("\n=== Memtable Keys (Active + Immutable) ===");
-            let mut debug_iters = Vec::new();
-            debug_iters.push(snapshot.memtable.scan(lower, upper));
+        // 添加当前 memtable
+        // Create iterators
+        let mem_iters = {
+            let mut iters = Vec::new();
+            iters.push(snapshot.memtable.scan(lower, upper));
             for imm_mem in &snapshot.imm_memtables {
-                debug_iters.push(imm_mem.scan(lower, upper));
+                iters.push(imm_mem.scan(lower, upper));
             }
-            let mut debug_merge_iter =
-                MergeIterator::create(debug_iters.into_iter().map(Box::new).collect());
-
-            // Print merged keys
-            while debug_merge_iter.is_valid() {
-                let key_str = String::from_utf8_lossy(debug_merge_iter.key().into_inner());
-                let value_str = String::from_utf8_lossy(debug_merge_iter.value());
-                println!("[Memtable] Key: '{}', Value: '{}'", key_str, value_str);
-                debug_merge_iter.next()?;
-            }
-        }
+            iters
+        };
+        let mem_merge_iter = MergeIterator::create(mem_iters.into_iter().map(Box::new).collect());
 
         // Create SSTable iterators (outside the critical section)
         let l0_merge_iter = self.create_l0_sst_iter(&snapshot, _lower, _upper)?;
-        // Debug print L0 SST keys
-        if debug_enabled {
-            println!("\n=== L0 SST Keys ===");
-            let mut debug_l0_iter = self.create_l0_sst_iter(&snapshot, _lower, _upper)?;
-            while debug_l0_iter.is_valid() {
-                let key_str = String::from_utf8_lossy(debug_l0_iter.key().key_ref());
-                let value_str = String::from_utf8_lossy(debug_l0_iter.value());
-                println!("[L0 SST] Key: '{}', Value: '{}'", key_str, value_str);
-                debug_l0_iter.next()?;
-            }
-        }
         let level_merge_iter = self.create_level_ssts_merge_iterator(&snapshot, _lower, _upper)?;
 
         let l0_sst_merge_iter = TwoMergeIterator::create(mem_merge_iter, l0_merge_iter)?;
-        // Debug print merged keys from memtable and L0
-        if debug_enabled {
-            println!("\n=== Merged Memtable + L0 Keys ===");
-            let mut debug_mem_iters = Vec::new();
-            debug_mem_iters.push(snapshot.memtable.scan(lower, upper));
-            for imm_mem in &snapshot.imm_memtables {
-                debug_mem_iters.push(imm_mem.scan(lower, upper));
-            }
-            let debug_mem_merge_iter =
-                MergeIterator::create(debug_mem_iters.into_iter().map(Box::new).collect());
-            let debug_l0_iter = self.create_l0_sst_iter(&snapshot, _lower, _upper)?;
-            let mut debug_merged = TwoMergeIterator::create(debug_mem_merge_iter, debug_l0_iter)?;
-
-            while debug_merged.is_valid() {
-                let key_str = String::from_utf8_lossy(debug_merged.key().key_ref());
-                let value_str = String::from_utf8_lossy(debug_merged.value());
-                println!(
-                    "[Merged Memtable + L0 Keys]: '{}', Value: '{}'",
-                    key_str, value_str
-                );
-                debug_merged.next()?;
-            }
-        }
-
         let two_merge_iter = TwoMergeIterator::create(l0_sst_merge_iter, level_merge_iter)?;
 
         // Create LSM iterator with upper bound
         let lsm_iter = LsmIterator::new(
             two_merge_iter,
             map_bound(_upper),
-            TS_RANGE_END, // Use TS_MAX as read timestamp to see all versions
+            read_ts, // Use TS_MAX as read timestamp to see all versions
         )?;
 
+        {
+            // Debug print mem_table keys
+            // Check if debug output should be enabled
+            let debug_enabled = std::env::var("RUST_BACKTRACE")
+                .map(|val| val == "1")
+                .unwrap_or(false);
+
+            // Debug print merged keys from memtable and L0
+            if debug_enabled {
+                // Create separate iterators for debug printing
+                println!("\n=== Memtable Keys (Active + Immutable) ===");
+                let mut debug_iters = Vec::new();
+                debug_iters.push(snapshot.memtable.scan(lower, upper));
+                for imm_mem in &snapshot.imm_memtables {
+                    debug_iters.push(imm_mem.scan(lower, upper));
+                }
+                let mut debug_merge_iter =
+                    MergeIterator::create(debug_iters.into_iter().map(Box::new).collect());
+
+                // Print merged keys
+                while debug_merge_iter.is_valid() {
+                    let key_str = String::from_utf8_lossy(debug_merge_iter.key().into_inner());
+                    let key_ts = debug_merge_iter.key().ts();
+                    let value_str = String::from_utf8_lossy(debug_merge_iter.value());
+                    println!(
+                        "[Memtable] Key: '{}'(ts = {}), Value: '{}'",
+                        key_str, key_ts, value_str
+                    );
+                    debug_merge_iter.next()?;
+                }
+
+                println!("\n=== L0 SST Keys ===");
+                let mut debug_l0_iter = self.create_l0_sst_iter(&snapshot, _lower, _upper)?;
+                while debug_l0_iter.is_valid() {
+                    let key_str = String::from_utf8_lossy(debug_l0_iter.key().key_ref());
+                    let key_ts = debug_l0_iter.key().ts();
+                    let value_str = String::from_utf8_lossy(debug_l0_iter.value());
+                    println!(
+                        "[L0 SST] Key: '{}'(ts = {}), Value: '{}'",
+                        key_str, key_ts, value_str
+                    );
+                    debug_l0_iter.next()?;
+                }
+
+                println!("\n=== Merged Memtable + L0 Keys ===");
+                let mut debug_mem_iters = Vec::new();
+                debug_mem_iters.push(snapshot.memtable.scan(lower, upper));
+                for imm_mem in &snapshot.imm_memtables {
+                    debug_mem_iters.push(imm_mem.scan(lower, upper));
+                }
+                let debug_mem_merge_iter =
+                    MergeIterator::create(debug_mem_iters.into_iter().map(Box::new).collect());
+                let debug_l0_iter = self.create_l0_sst_iter(&snapshot, _lower, _upper)?;
+                let mut debug_merged =
+                    TwoMergeIterator::create(debug_mem_merge_iter, debug_l0_iter)?;
+
+                while debug_merged.is_valid() {
+                    let key_str: std::borrow::Cow<'_, str> =
+                        String::from_utf8_lossy(debug_merged.key().key_ref());
+                    let key_ts = debug_merged.key().ts();
+                    let value_str = String::from_utf8_lossy(debug_merged.value());
+                    println!(
+                        "[Merged Memtable + L0 Keys]: '{}' (ts = {}), Value: '{}'",
+                        key_str, key_ts, value_str
+                    );
+                    debug_merged.next()?;
+                }
+            }
+        }
+
         Ok(FusedIterator::new(lsm_iter))
+    }
+
+    /// Create an iterator over a range of keys.
+    pub fn scan(
+        self: &Arc<Self>,
+        _lower: Bound<&[u8]>,
+        _upper: Bound<&[u8]>,
+    ) -> Result<TxnIterator> {
+        // Create a new transaction
+        let txn = if let Some(mvcc) = &self.mvcc {
+            mvcc.new_txn(self.clone(), self.options.serializable)
+        } else {
+            // If MVCC is not enabled, create a simple transaction with MAX timestamp
+            Arc::new(Transaction {
+                read_ts: u64::MAX,
+                inner: self.clone(),
+                local_storage: Arc::new(SkipMap::new()),
+                committed: Arc::new(AtomicBool::new(false)),
+                key_hashes: None,
+            })
+        };
+
+        // Get iterator using transaction's read timestamp
+        let iter = self.scan_with_ts(_lower, _upper, txn.read_ts)?;
+
+        // Create transaction iterator
+        TxnIterator::create(
+            txn,
+            TwoMergeIterator::create(
+                TxnLocalIterator::create_empty(Arc::new(SkipMap::new())),
+                iter,
+            )?,
+        )
     }
 
     /// for l0 sst iterator

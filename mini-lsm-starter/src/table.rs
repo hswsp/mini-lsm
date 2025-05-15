@@ -187,13 +187,21 @@ impl FileObject {
 /// |                               |  varlen  |         u32       |    varlen    |        u32          |
 /// -----------------------------------------------------------------------------------------------------
 ///                        block_meta_offset    meta_offset_pos      bloom_offset   bloom_offset_pos
-/// Part 2: add check sum in Meta Section.
+/// Version 2: add check sum in Meta Section.
 /// ----------------------------------------------------------------------------------------------------------------------------------------------------------------
 /// |                   Block Section                     |                                                Meta Section                                            |
 /// ----------------------------------------------------------------------------------------------------------------------------------------------------------------
 /// | data block | checksum | ... | data block | checksum | no. of block | metadata | checksum | meta block offset | bloom filter | checksum | bloom filter offset |
 /// |   varlen   |    u32   |     |   varlen   |    u32   |     u32      |  varlen  |    u32   |        u32        |    varlen    |    u32   |        u32          |
 /// ----------------------------------------------------------------------------------------------------------------------------------------------------------------
+///
+/// Version 3: add largest timestamp after the block metadata.
+/// ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+/// |                   Block Section                     |                                                Meta Section                                            |    LT            |
+/// ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+/// | data block | checksum | ... | data block | checksum | no. of block | metadata | checksum | meta block offset | bloom filter | checksum | bloom filter offset | largest timestamp |
+/// |   varlen   |    u32   |     |   varlen   |    u32   |     u32      |  varlen  |    u32   |        u32        |    varlen    |    u32   |        u32          |        u64        |
+/// ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 pub struct SsTable {
     /// The actual storage unit of SsTable, the format is as above.
     pub(crate) file: FileObject,

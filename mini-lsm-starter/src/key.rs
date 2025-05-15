@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{cmp::Reverse, fmt::Debug};
+use std::{cmp::Reverse, fmt::Debug, ops::Bound};
 
 use bytes::Bytes;
 
@@ -210,5 +210,46 @@ impl<T: AsRef<[u8]> + PartialOrd> PartialOrd for Key<T> {
 impl<T: AsRef<[u8]> + Ord> Ord for Key<T> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         (self.0.as_ref(), Reverse(self.1)).cmp(&(other.0.as_ref(), Reverse(other.1)))
+    }
+}
+
+/// Create a bound of `Bytes` from a bound of `&[u8]`.
+pub(crate) fn map_bound(bound: Bound<&[u8]>) -> Bound<Bytes> {
+    match bound {
+        Bound::Included(x) => Bound::Included(Bytes::copy_from_slice(x)),
+        Bound::Excluded(x) => Bound::Excluded(Bytes::copy_from_slice(x)),
+        Bound::Unbounded => Bound::Unbounded,
+    }
+}
+/// Create a bound of `Bytes` from a bound of `KeySlice`.
+pub(crate) fn map_key_bound(bound: Bound<KeySlice>) -> Bound<KeyBytes> {
+    match bound {
+        Bound::Included(x) => Bound::Included(KeyBytes::from_bytes_with_ts(
+            Bytes::copy_from_slice(x.key_ref()),
+            x.ts(),
+        )),
+        Bound::Excluded(x) => Bound::Excluded(KeyBytes::from_bytes_with_ts(
+            Bytes::copy_from_slice(x.key_ref()),
+            x.ts(),
+        )),
+        Bound::Unbounded => Bound::Unbounded,
+    }
+}
+
+// Helper function to convert bound references to owned Bytes
+pub(crate) fn map_bound_to_bytes(bound: Bound<&[u8]>) -> Bound<Bytes> {
+    match bound {
+        Bound::Included(key) => Bound::Included(Bytes::copy_from_slice(key)),
+        Bound::Excluded(key) => Bound::Excluded(Bytes::copy_from_slice(key)),
+        Bound::Unbounded => Bound::Unbounded,
+    }
+}
+
+/// Create a bound of `Bytes` from a bound of `KeySlice`.
+pub(crate) fn map_key_bound_plus_ts(bound: Bound<&[u8]>, ts: u64) -> Bound<KeySlice> {
+    match bound {
+        Bound::Included(x) => Bound::Included(KeySlice::from_slice(x, ts)),
+        Bound::Excluded(x) => Bound::Excluded(KeySlice::from_slice(x, ts)),
+        Bound::Unbounded => Bound::Unbounded,
     }
 }
