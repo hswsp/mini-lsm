@@ -18,6 +18,7 @@
 use std::collections::BTreeMap;
 
 pub struct Watermark {
+    /// Map from timestamp to number of active transactions at that time
     readers: BTreeMap<u64, usize>,
 }
 
@@ -28,11 +29,44 @@ impl Watermark {
         }
     }
 
-    pub fn add_reader(&mut self, ts: u64) {}
+    /// Adds a reader at the given timestamp
+    pub fn add_reader(&mut self, ts: u64) {
+        *self.readers.entry(ts).or_insert(0) += 1;
+    }
 
-    pub fn remove_reader(&mut self, ts: u64) {}
+    /// Removes a reader at the given timestamp
+    pub fn remove_reader(&mut self, ts: u64) {
+        if let Some(count) = self.readers.get_mut(&ts) {
+            *count -= 1;
+            if *count == 0 {
+                // Remove entry if no more readers at this timestamp
+                self.readers.remove(&ts);
+            }
+        }
+    }
 
+    pub fn num_retained_snapshots(&self) -> usize {
+        self.readers.len()
+    }
+
+    /// Returns the lowest read timestamp among active transactions,
+    /// or None if there are no active transactions
     pub fn watermark(&self) -> Option<u64> {
-        Some(0)
+        // First key in BTreeMap is the lowest timestamp
+        self.readers.keys().next().copied()
+    }
+
+    /// Returns a debug view of current readers
+    pub fn debug_readers(&self) -> Vec<(u64, usize)> {
+        self.readers
+            .iter()
+            .map(|(ts, count)| (*ts, *count))
+            .collect()
+    }
+}
+
+impl Default for Watermark {
+    fn default() -> Self {
+        Self::new()
     }
 }

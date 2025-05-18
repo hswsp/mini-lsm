@@ -92,7 +92,27 @@ impl Transaction {
 }
 
 impl Drop for Transaction {
-    fn drop(&mut self) {}
+    fn drop(&mut self) {
+        // Get MVCC manager from storage
+        if let Some(mvcc) = &self.inner.mvcc {
+            let mut ts_lock = mvcc.ts.lock();
+            // Remove this transaction's read timestamp from watermark
+            ts_lock.1.remove_reader(self.read_ts);
+
+            // Print watermark info after removal
+            let debug_enabled = std::env::var("RUST_BACKTRACE")
+                .map(|val| val == "1")
+                .unwrap_or(false);
+
+            if debug_enabled {
+                println!(
+                    "[Transaction Drop] Before removal - Current watermark: {:?}, Remaining readers: {:?}",
+                    ts_lock.1.watermark(),
+                    ts_lock.1.debug_readers()
+                );
+            }
+        }
+    }
 }
 
 type SkipMapRangeIter<'a> =

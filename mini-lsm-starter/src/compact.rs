@@ -193,6 +193,108 @@ impl LsmStorageInner {
         Ok(())
     }
 
+    fn do_compaction_on_iter<I>(
+        &self,
+        merge_iter: &mut SsTableIteratorWrapper<I>,
+        is_bottom_level: bool,
+    ) -> Result<Vec<Arc<SsTable>>>
+    where
+        I: 'static + for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>,
+    {
+        // Get watermark from MVCC manager
+        let watermark = if let Some(mvcc) = &self.mvcc {
+            mvcc.watermark()
+        } else {
+            0
+        };
+
+        let mut new_ssts = Vec::new();
+        let mut current_builder = SsTableBuilder::new(self.options.block_size);
+        let mut current_size = 0;
+
+        // Track versions of current key for cleanup
+        let mut last_user_key: Option<Vec<u8>> = None;
+        let mut pending_versions: Vec<(Vec<u8>, Vec<u8>, u64)> = Vec::new(); // (key_ref, value, ts)
+        let mut has_version_above_watermark = false;
+
+        // for now, and you should keep ALL versions of a key during the compaction.
+        while merge_iter.is_valid() {
+            let key = merge_iter.key();
+            let key_ref = key.key_ref().to_vec();
+            let ts = key.ts();
+            let value = merge_iter.value().to_vec();
+
+            // Check if we're processing a new key
+            if last_user_key.as_ref() != Some(&key_ref) {
+                // Process previous key's versions if any
+                // If we have any versions above or equal to watermark, delete all versions below
+                if !has_version_above_watermark && !pending_versions.is_empty() {
+                    let (latest_key_data, latest_value, latest_ts) = &pending_versions[0];
+                    // For versions below watermark, only keep latest version
+                    if !is_bottom_level || !latest_value.is_empty() {
+                        let latest_key = KeySlice::from_slice(latest_key_data, *latest_ts);
+                        // Keep deletion marker only if not compacting to bottom level
+                        current_builder.add(latest_key, latest_value);
+                        current_size += latest_key.raw_len() + latest_value.len();
+                    }
+                }
+
+                // Check if we need to seal current SST
+                if current_size >= self.options.target_sst_size {
+                    self.seal_sst(current_builder, &mut new_ssts)?;
+                    current_builder = SsTableBuilder::new(self.options.block_size);
+                    current_size = 0;
+                }
+
+                // Reset for new key
+                last_user_key = Some(key_ref.clone());
+                pending_versions.clear();
+                has_version_above_watermark = false;
+            }
+
+            // Process current version
+            match key.ts().cmp(&watermark) {
+                std::cmp::Ordering::Greater => {
+                    // Version is newer than watermark, keep it
+                    has_version_above_watermark = true;
+                    current_builder.add(key, &value);
+                    current_size += key.raw_len() + value.len();
+                }
+                std::cmp::Ordering::Equal => {
+                    // Version is at watermark, keep it only if not deleted
+                    has_version_above_watermark = true;
+                    if !value.is_empty() {
+                        current_builder.add(key, &value);
+                        current_size += key.raw_len() + value.len();
+                    }
+                }
+                std::cmp::Ordering::Less => {
+                    // Version is older than watermark, save for potential keep-latest logic
+                    pending_versions.push((key_ref, value, ts));
+                }
+            }
+
+            merge_iter.next()?;
+        }
+
+        // Process the last key if any
+        if !has_version_above_watermark && !pending_versions.is_empty() {
+            let (latest_key_data, latest_value, latest_ts) = &pending_versions[0];
+            if !is_bottom_level || !latest_value.is_empty() {
+                let latest_key = KeySlice::from_slice(latest_key_data, *latest_ts);
+                current_builder.add(latest_key, latest_value);
+                current_size += latest_key.raw_len() + latest_value.len();
+            }
+        }
+
+        // Flush last SST if it contains any data
+        if current_size > 0 {
+            self.seal_sst(current_builder, &mut new_ssts)?;
+        }
+
+        Ok(new_ssts)
+    }
+
     fn compact(&self, _task: &CompactionTask) -> Result<Vec<Arc<SsTable>>> {
         // Take a snapshot of current state
         let snapshot = {
@@ -311,48 +413,9 @@ impl LsmStorageInner {
             }
         };
 
+        let is_bottom_level = _task.compact_to_bottom_level();
         // Create new SSTs with compacted data
-        let mut new_ssts = Vec::new();
-        let mut current_builder = SsTableBuilder::new(self.options.block_size);
-        let mut current_size = 0;
-        let mut last_user_key: Option<Vec<u8>> = None;
-
-        // for now, and you should keep ALL versions of a key during the compaction.
-        while merge_iter.is_valid() {
-            let current_key = merge_iter.key();
-            let current_value = merge_iter.value();
-
-            match &last_user_key {
-                Some(last_key) if last_key == current_key.key_ref() => {
-                    // he same key with different timestamps are put in the same SST file,
-                    // even if it exceeds the SST size limit
-                    current_builder.add(current_key, current_value);
-                    current_size += current_key.raw_len() + current_value.len();
-                }
-                _ => {
-                    // Different user key
-                    if current_size >= self.options.target_sst_size {
-                        // Only seal SST when we see a different user key
-                        self.seal_sst(current_builder, &mut new_ssts)?;
-                        current_builder = SsTableBuilder::new(self.options.block_size);
-                        current_size = 0;
-                    }
-                    // Add the key-value pair
-                    current_builder.add(current_key, current_value);
-                    current_size += current_key.raw_len() + current_value.len();
-                    // Update last_user_key
-                    last_user_key = Some(current_key.key_ref().to_vec());
-                }
-            }
-            merge_iter.next()?;
-        }
-
-        // Flush last SST if it contains any data
-        if current_size > 0 {
-            self.seal_sst(current_builder, &mut new_ssts)?;
-        }
-
-        Ok(new_ssts)
+        self.do_compaction_on_iter(&mut merge_iter, is_bottom_level)
     }
 
     pub fn force_full_compaction(&self) -> Result<()> {
