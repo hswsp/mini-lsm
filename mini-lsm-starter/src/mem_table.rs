@@ -120,30 +120,38 @@ impl MemTable {
     /// In week 2, day 6, also flush the data to WAL.
     /// In week 3, day 5, modify the function to use the batch API.
     pub fn put(&self, key: KeySlice, value: &[u8]) -> Result<()> {
-        let key_bytes =
-            KeyBytes::from_bytes_with_ts(Bytes::copy_from_slice(key.key_ref()), key.ts());
-        let value_bytes = Bytes::copy_from_slice(value);
-
-        // 更新近似大小, freeze the memtable at best effort.
-        // If a key is put twice, though the skiplist only contains the latest value,
-        // you may count it twice in the approximate memtable size
-        self.approximate_size.fetch_add(
-            key.raw_len() + value.len(),
-            std::sync::atomic::Ordering::Relaxed,
-        );
-
-        // Write to WAL first if it exists
-        if let Some(ref wal) = self.wal {
-            wal.put(key, value)?;
-        }
-
-        self.map.insert(key_bytes, value_bytes);
-        Ok(())
+        self.put_batch(&[(key, value)])
     }
 
     /// Implement this in week 3, day 5.
     pub fn put_batch(&self, _data: &[(KeySlice, &[u8])]) -> Result<()> {
-        unimplemented!()
+        // Calculate total size for approximate size tracking
+        let total_size: usize = _data
+            .iter()
+            .map(|(key, value)| key.raw_len() + value.len())
+            .sum();
+
+        // Update approximate size
+        self.approximate_size
+            .fetch_add(total_size, std::sync::atomic::Ordering::Relaxed);
+
+        // Write to WAL first if it exists
+        if let Some(ref wal) = self.wal {
+            for (key, value) in _data {
+                wal.put(*key, value)?;
+            }
+            // Note: If WAL batch write is needed, we can add it to WAL implementation
+        }
+
+        // Insert all key-value pairs into the skipmap
+        for (key, value) in _data {
+            let key_bytes =
+                KeyBytes::from_bytes_with_ts(Bytes::copy_from_slice(key.key_ref()), key.ts());
+            let value_bytes = Bytes::copy_from_slice(value);
+            self.map.insert(key_bytes, value_bytes);
+        }
+
+        Ok(())
     }
 
     pub fn sync_wal(&self) -> Result<()> {

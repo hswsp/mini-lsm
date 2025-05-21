@@ -35,7 +35,7 @@ use crate::iterators::StorageIterator;
 use crate::iterators::concat_iterator::SstConcatIterator;
 use crate::iterators::two_merge_iterator::TwoMergeIterator;
 use crate::key::{
-    KeySlice, TS_DEFAULT, TS_RANGE_BEGIN, TS_RANGE_END, map_bound, map_key_bound_plus_ts,
+    Key, KeySlice, TS_DEFAULT, TS_RANGE_BEGIN, TS_RANGE_END, map_bound, map_key_bound_plus_ts,
 };
 use crate::manifest::ManifestRecord;
 use crate::mvcc::txn::{Transaction, TxnIterator, TxnLocalIterator};
@@ -695,56 +695,49 @@ impl LsmStorageInner {
         }
         Ok(())
     }
-    /// Write a batch of data into the storage. Implement in week 2 day 7.
-    pub fn write_batch<T: AsRef<[u8]>>(&self, _batch: &[WriteBatchRecord<T>]) -> Result<()> {
-        // Acquire MVCC write lock to ensure atomic batch writes
-        let _write_guard = if let Some(mvcc) = &self.mvcc {
-            Some(mvcc.write_lock.lock())
-        } else {
-            Some(self.state_lock.lock())
-        };
 
-        // Get timestamp
-        let ts = if let Some(mvcc) = &self.mvcc {
-            // Get commit timestamp for the entire batch
-            mvcc.latest_commit_ts() + 1
-        } else {
-            // Use current timestamp when MVCC is not enabled
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs()
-        };
+    pub fn write_batch_lsm<T: AsRef<[u8]>>(&self, _batch: &[WriteBatchRecord<T>]) -> Result<u64> {
+        // Acquire MVCC write lock to ensure atomic batch writes
+        let _write_guard = self.mvcc().write_lock.lock();
+
+        // Get commit timestamp for the entire batch
+        let ts = self.mvcc().latest_commit_ts() + 1;
         // Print debug info
         // println!("Write batch with timestamp: {}", ts);
 
-        let estimated_size = {
-            // Get read lock scope for initial write to memtable
-            let state = self.state.read();
+        let mut batch_datas: Vec<(Key<&[u8]>, &[u8])> = vec![];
 
+        let estimated_size = {
             // Process each record in the batch
             for record in _batch {
                 match record {
                     WriteBatchRecord::Put(key, value) => {
+                        assert!(!key.as_ref().is_empty(), "key cannot be empty");
+                        assert!(!value.as_ref().is_empty(), "value cannot be empty");
                         let key_slice = KeySlice::from_slice(key.as_ref(), ts);
-                        state.memtable.put(key_slice, value.as_ref())?;
+                        batch_datas.push((key_slice, value.as_ref()));
                     }
                     WriteBatchRecord::Del(key) => {
+                        assert!(!key.as_ref().is_empty(), "key cannot be empty");
                         let key_slice = KeySlice::from_slice(key.as_ref(), ts);
                         // Delete by writing empty value
-                        state.memtable.put(key_slice, &[])?;
+                        batch_datas.push((key_slice, b""));
                     }
                 }
             }
 
-            // Get approximate size after batch write
-            state.memtable.approximate_size()
+            let size = {
+                // Get read lock scope for initial write to memtable
+                let state = self.state.read();
+                state.memtable.put_batch(&batch_datas)?;
+                // Get approximate size after batch write
+                state.memtable.approximate_size()
+            };
+            size
         }; // Read lock is released here
 
-        // Update the commit timestamp after successful batch write
-        if let Some(mvcc) = &self.mvcc {
-            mvcc.update_commit_ts(ts);
-        }
+        // Update commit timestamp after successful write
+        self.mvcc().update_commit_ts(ts);
 
         // Check if memtable needs to be frozen after batch write
         // 如果俩线程同时reaches capacity limit.
@@ -752,16 +745,43 @@ impl LsmStorageInner {
         // In this case, we might create one empty memtable which is then immediately frozen.
         self.try_freeze(estimated_size)?;
 
+        Ok(ts)
+    }
+
+    /// Write a batch of data into the storage. Implement in week 2 day 7.
+    pub fn write_batch<T: AsRef<[u8]>>(
+        self: &Arc<Self>,
+        _batch: &[WriteBatchRecord<T>],
+    ) -> Result<()> {
+        if !self.options.serializable {
+            self.write_batch_lsm(_batch)?;
+        } else {
+            // Create a transaction using the existing LsmStorageInner
+            let txn = self.new_txn()?;
+
+            for record in _batch {
+                match record {
+                    WriteBatchRecord::Del(key) => {
+                        txn.delete(key.as_ref());
+                    }
+                    WriteBatchRecord::Put(key, value) => {
+                        txn.put(key.as_ref(), value.as_ref());
+                    }
+                }
+            }
+            txn.commit()?;
+        }
+
         Ok(())
     }
 
     /// Put a key-value pair into the storage by writing into the current memtable.
-    pub fn put(&self, _key: &[u8], value: &[u8]) -> Result<()> {
+    pub fn put(self: &Arc<Self>, _key: &[u8], value: &[u8]) -> Result<()> {
         self.write_batch(&[WriteBatchRecord::Put(_key, value)])
     }
 
     /// Remove a key from the storage by writing an empty value.
-    pub fn delete(&self, _key: &[u8]) -> Result<()> {
+    pub fn delete(self: &Arc<Self>, _key: &[u8]) -> Result<()> {
         self.write_batch(&[WriteBatchRecord::Del(_key)])
     }
 
@@ -1072,7 +1092,7 @@ impl LsmStorageInner {
         TxnIterator::create(
             txn,
             TwoMergeIterator::create(
-                TxnLocalIterator::create_empty(Arc::new(SkipMap::new())),
+                TxnLocalIterator::create_empty(Arc::new(SkipMap::new()), _lower, _upper),
                 iter,
             )?,
         )

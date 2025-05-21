@@ -31,7 +31,7 @@ use crate::{
     iterators::{StorageIterator, two_merge_iterator::TwoMergeIterator},
     key::map_bound_to_bytes,
     lsm_iterator::{FusedIterator, LsmIterator},
-    lsm_storage::LsmStorageInner,
+    lsm_storage::{LsmStorageInner, WriteBatchRecord},
 };
 
 pub struct Transaction {
@@ -44,10 +44,24 @@ pub struct Transaction {
 }
 
 impl Transaction {
+    fn check_not_committed(&self) -> Result<()> {
+        if self.committed.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(anyhow::anyhow!("transaction already committed"));
+        }
+        Ok(())
+    }
+
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        self.check_not_committed()?;
         // First check local storage for any uncommitted changes
         if let Some(value) = self.local_storage.get(key) {
-            return Ok(Some(value.value().clone()));
+            let value = value.value();
+            // If value is empty, it's a deletion marker - return None
+            if value.is_empty() {
+                return Ok(None);
+            }
+            // Otherwise return the local value
+            return Ok(Some(value.clone()));
         }
 
         // If not in local storage, query storage engine with read timestamp
@@ -55,17 +69,11 @@ impl Transaction {
     }
 
     pub fn scan(self: &Arc<Self>, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> Result<TxnIterator> {
-        // Convert bounds to owned bytes for storage operations
-        let lower_bytes = map_bound_to_bytes(lower);
-        let upper_bytes = map_bound_to_bytes(upper);
+        self.check_not_committed()?;
 
         // Create iterator over local storage modifications
-        let local_iter = TxnLocalIteratorBuilder {
-            map: Arc::clone(&self.local_storage),
-            iter_builder: |map| map.range((lower_bytes, upper_bytes)),
-            item: (Bytes::new(), Bytes::new()),
-        }
-        .build();
+        let local_iter =
+            TxnLocalIterator::create_empty(Arc::clone(&self.local_storage), lower, upper);
 
         // Get iterator from storage engine with read timestamp
         println!("[Transaction] current read_ts: {}", self.read_ts);
@@ -79,15 +87,41 @@ impl Transaction {
     }
 
     pub fn put(&self, key: &[u8], value: &[u8]) {
-        unimplemented!()
+        let _ = self.check_not_committed();
+        // Insert the key-value pair into local storage
+        // Convert input slices to Bytes for storage
+        self.local_storage
+            .insert(Bytes::copy_from_slice(key), Bytes::copy_from_slice(value));
     }
 
     pub fn delete(&self, key: &[u8]) {
-        unimplemented!()
+        // Convert empty Bytes to &[u8] slice by using as_ref()
+        self.put(key, Bytes::new().as_ref());
     }
 
     pub fn commit(&self) -> Result<()> {
-        unimplemented!()
+        // Check if already committed
+        self.check_not_committed()?;
+
+        let _commit_guard = self.inner.mvcc().commit_lock.lock();
+
+        // Collect all key-value pairs from local storage
+        let mut write_batch = Vec::new();
+
+        for entry in self.local_storage.iter() {
+            let key = entry.key().clone();
+            let value = entry.value().clone();
+            write_batch.push(WriteBatchRecord::Put(key, value));
+        }
+
+        // Submit write batch to storage engine
+        let commit_ts = self.inner.write_batch_lsm(&write_batch)?;
+
+        // Set committed flag to true
+        self.committed
+            .store(true, std::sync::atomic::Ordering::Release);
+
+        Ok(())
     }
 }
 
@@ -139,14 +173,25 @@ pub struct TxnLocalIterator {
 }
 
 impl TxnLocalIterator {
-    pub fn create_empty(map: Arc<SkipMap<Bytes, Bytes>>) -> Self {
-        let empty_bounds = (Bound::Unbounded, Bound::Unbounded);
-        TxnLocalIteratorBuilder {
+    pub fn create_empty(
+        map: Arc<SkipMap<Bytes, Bytes>>,
+        _lower: Bound<&[u8]>,
+        _upper: Bound<&[u8]>,
+    ) -> Self {
+        // Convert bounds to owned bytes for storage operations
+        let lower_bytes = map_bound_to_bytes(_lower);
+        let upper_bytes = map_bound_to_bytes(_upper);
+
+        let mut iter = TxnLocalIteratorBuilder {
             map: map.clone(),
-            iter_builder: |map| map.range(empty_bounds),
+            iter_builder: |map| map.range((lower_bytes, upper_bytes)),
             item: (Bytes::new(), Bytes::new()),
         }
-        .build()
+        .build();
+
+        // Move to first item
+        iter.next().unwrap();
+        iter
     }
 }
 
@@ -198,6 +243,13 @@ impl TxnIterator {
     ) -> Result<Self> {
         Ok(Self { _txn: txn, iter })
     }
+
+    fn skip_deletes(&mut self) -> Result<()> {
+        while self.iter.is_valid() && self.iter.value().is_empty() {
+            self.iter.next()?;
+        }
+        Ok(())
+    }
 }
 
 impl StorageIterator for TxnIterator {
@@ -221,7 +273,12 @@ impl StorageIterator for TxnIterator {
     fn next(&mut self) -> Result<()> {
         // Simply delegate to the underlying iterator
         // The TwoMergeIterator will handle merging results from local storage and LSM storage
-        self.iter.next()
+        self.iter.next()?;
+
+        // given that the TwoMergeIterator will retain the deletion markers in the child iterators
+        self.skip_deletes()?;
+
+        Ok(())
     }
 
     fn num_active_iterators(&self) -> usize {
