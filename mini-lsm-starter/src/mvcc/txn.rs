@@ -34,6 +34,8 @@ use crate::{
     lsm_storage::{LsmStorageInner, WriteBatchRecord},
 };
 
+use super::CommittedTxnData;
+
 pub struct Transaction {
     pub(crate) read_ts: u64,
     pub(crate) inner: Arc<LsmStorageInner>,
@@ -53,6 +55,14 @@ impl Transaction {
 
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
         self.check_not_committed()?;
+
+        // Add key to read set if serializable isolation is enabled
+        if let Some(key_hashes) = &self.key_hashes {
+            let hash = farmhash::hash32(key);
+            let mut guard = key_hashes.lock();
+            guard.1.insert(hash); // Insert into read set (second element of tuple)
+        }
+
         // First check local storage for any uncommitted changes
         if let Some(value) = self.local_storage.get(key) {
             let value = value.value();
@@ -88,6 +98,14 @@ impl Transaction {
 
     pub fn put(&self, key: &[u8], value: &[u8]) {
         let _ = self.check_not_committed();
+
+        // Add key to write set if serializable isolation is enabled
+        if let Some(key_hashes) = &self.key_hashes {
+            let hash = farmhash::hash32(key);
+            let mut guard = key_hashes.lock();
+            guard.0.insert(hash); // Insert into write set (first element of tuple)
+        }
+
         // Insert the key-value pair into local storage
         // Convert input slices to Bytes for storage
         self.local_storage
@@ -105,17 +123,70 @@ impl Transaction {
 
         let _commit_guard = self.inner.mvcc().commit_lock.lock();
 
-        // Collect all key-value pairs from local storage
-        let mut write_batch = Vec::new();
+        // If serializable isolation is enabled, check for conflicts
+        if let Some(key_hashes) = &self.key_hashes {
+            let key_hashes = key_hashes.lock();
+            let read_set = &key_hashes.1; // Get read set
+            let write_set = &key_hashes.0; // Get write set
 
-        for entry in self.local_storage.iter() {
-            let key = entry.key().clone();
-            let value = entry.value().clone();
-            write_batch.push(WriteBatchRecord::Put(key, value));
+            // Get commit timestamp before validation
+            let expected_commit_ts = self.inner.mvcc().latest_commit_ts() + 1;
+
+            // Check for conflicts in committed transactions
+            let committed_txns = self.inner.mvcc().committed_txns.lock();
+
+            // both excluded bounds
+            let lower_bound = Bound::Excluded(self.read_ts);
+            let upper_bound = Bound::Excluded(expected_commit_ts);
+
+            // Iterate through transactions committed after our read_ts
+            for (&commit_ts, txn_data) in committed_txns.range((lower_bound, upper_bound)) {
+                // Check if read set intersects with the committed transaction's write set
+                for &hash in read_set {
+                    if txn_data.key_hashes.contains(&hash) {
+                        return Err(anyhow::anyhow!(
+                            "[txn {}]serialization failure: read-write conflict detected with transaction committed at ts {}",
+                            self.read_ts,
+                            commit_ts
+                        ));
+                    }
+                }
+            }
+            drop(committed_txns); // Release lock early
+
+            // Collect all key-value pairs from local storage
+            let mut write_batch = Vec::new();
+
+            for entry in self.local_storage.iter() {
+                let key = entry.key().clone();
+                let value = entry.value().clone();
+                write_batch.push(WriteBatchRecord::Put(key, value));
+            }
+
+            // Submit write batch to storage engine
+            let commit_ts = self.inner.write_batch_lsm(&write_batch)?;
+
+            // Record this transaction's write set
+            let mut committed_txns = self.inner.mvcc().committed_txns.lock();
+            committed_txns.insert(
+                commit_ts,
+                CommittedTxnData {
+                    key_hashes: write_set.clone(),
+                    read_ts: self.read_ts,
+                    commit_ts,
+                },
+            );
+        } else {
+            // Non-serializable transaction - just write the batch
+            let mut write_batch = Vec::new();
+
+            for entry in self.local_storage.iter() {
+                let key = entry.key().clone();
+                let value = entry.value().clone();
+                write_batch.push(WriteBatchRecord::Put(key, value));
+            }
+            self.inner.write_batch_lsm(&write_batch)?;
         }
-
-        // Submit write batch to storage engine
-        let commit_ts = self.inner.write_batch_lsm(&write_batch)?;
 
         // Set committed flag to true
         self.committed
@@ -137,13 +208,21 @@ impl Drop for Transaction {
             let debug_enabled = std::env::var("RUST_BACKTRACE")
                 .map(|val| val == "1")
                 .unwrap_or(false);
-
             if debug_enabled {
                 println!(
                     "[Transaction Drop] Before removal - Current watermark: {:?}, Remaining readers: {:?}",
                     ts_lock.1.watermark(),
                     ts_lock.1.debug_readers()
                 );
+            }
+
+            // When you commit a transaction, you can also clean up the committed txn map to remove all transactions below the watermark
+            if self.committed.load(std::sync::atomic::Ordering::Acquire) {
+                // Get current watermark
+                let watermark = ts_lock.1.watermark().unwrap_or(ts_lock.0);
+                // Clean up old transactions below watermark
+                let mut committed_txns = self.inner.mvcc().committed_txns.lock();
+                committed_txns.retain(|&ts, _| ts >= watermark);
             }
         }
     }
@@ -246,6 +325,13 @@ impl TxnIterator {
 
     fn skip_deletes(&mut self) -> Result<()> {
         while self.iter.is_valid() && self.iter.value().is_empty() {
+            // Add key to read set before skipping
+            if let Some(key_hashes) = &self._txn.key_hashes {
+                let hash = farmhash::hash32(self.iter.key());
+                let mut guard = key_hashes.lock();
+                guard.1.insert(hash);
+            }
+
             self.iter.next()?;
         }
         Ok(())
@@ -271,6 +357,15 @@ impl StorageIterator for TxnIterator {
     }
 
     fn next(&mut self) -> Result<()> {
+        // Add current key to read set before moving to next
+        if self.is_valid() {
+            if let Some(key_hashes) = &self._txn.key_hashes {
+                let hash = farmhash::hash32(self.iter.key());
+                let mut guard = key_hashes.lock();
+                guard.1.insert(hash);
+            }
+        }
+
         // Simply delegate to the underlying iterator
         // The TwoMergeIterator will handle merging results from local storage and LSM storage
         self.iter.next()?;

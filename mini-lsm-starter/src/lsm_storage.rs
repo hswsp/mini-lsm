@@ -756,7 +756,7 @@ impl LsmStorageInner {
         if !self.options.serializable {
             self.write_batch_lsm(_batch)?;
         } else {
-            // Create a transaction using the existing LsmStorageInner
+            // If options.serializable = true, create a transaction instead of directly creating a write batch.
             let txn = self.new_txn()?;
 
             for record in _batch {
